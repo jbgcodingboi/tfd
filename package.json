@@ -16,21 +16,21 @@
     "sync": "node scripts/sync-backend.mjs"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.118.0",
+    "@supabase/supabase-js": "^2.119.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "react-router-dom": "^7.18.4",
-    "zustand": "^5.0.15"
+    "react-router-dom": "^7.18.5",
+    "zustand": "^5.0.16"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.3.3",
+    "@tailwindcss/vite": "^4.3.4",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
-    "@vitejs/plugin-react": "^6.1.1",
-    "oxlint": "^1.81.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "oxlint": "^1.91.0",
     "tailwindcss": "^4.3.3",
-    "vite": "^8.3.0",
-    "vitest": "^5.0.5"
+    "vite": "^8.3.6",
+    "vitest": "^5.1.0"
   },
   "description": "Paper trading prediction market demo (play money only). Vite + React + Tailwind."
 }
