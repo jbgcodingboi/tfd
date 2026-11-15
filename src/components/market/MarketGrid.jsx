@@ -1,5 +1,6 @@
 import { memo, useState } from 'react'
 import { MarketCardSkeleton } from '../ui/Skeleton.jsx'
+import GroupCard from './GroupCard.jsx'
 import MarketCard from './MarketCard.jsx'
 
 const PAGE = 48
@@ -19,9 +20,9 @@ function MarketGrid({ markets, loading, empty }) {
   return (
     <div className="space-y-4">
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        {markets.slice(0, limit).map((m) => (
-          <MarketCard key={m.id} market={m} />
-        ))}
+        {markets.slice(0, limit).map((m) =>
+          m.kind === 'group' ? <GroupCard key={`g-${m.id}`} group={m} /> : <MarketCard key={m.id} market={m} />,
+        )}
       </div>
       {markets.length > limit && (
         <div className="text-center">

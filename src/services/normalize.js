@@ -95,6 +95,8 @@ export function normalizeGammaMarket(raw, category, { league = null } = {}) {
     title,
     description: cleanText(raw.description, 2000),
     eventTitle: cleanText(event?.title, 300),
+    // The outcome's short name within its event ("Kansas City Chiefs" in "Super Bowl Champion 2027").
+    outcomeLabel: cleanText(raw.groupItemTitle, 100),
     category,
     league,
     tags: normalizeTags(event?.tags),

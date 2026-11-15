@@ -34,7 +34,8 @@ export const SORTS = [
 export function sortMarkets(markets, sort, isResolved = () => false, { sportsFirst = false } = {}) {
   const list = [...markets]
   const cmp = {
-    volume: (a, b) => b.volume - a.volume,
+    // A winner event ranks by its total volume (every outcome carries it as groupVolume).
+    volume: (a, b) => (b.groupVolume ?? b.volume) - (a.groupVolume ?? a.volume),
     newest: (a, b) => time(b.createdAt, 0) - time(a.createdAt, 0),
     ending: (a, b) => time(a.endDate, Infinity) - time(b.endDate, Infinity),
   }[sort] ?? ((a, b) => b.volume - a.volume)

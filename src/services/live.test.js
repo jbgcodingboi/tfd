@@ -162,6 +162,51 @@ describe('live data flow', () => {
     expect(eventsCall).toContain('end_date_max=2027-06-02')
   })
 
+  it('keeps every outcome of a winner event, grouped, and ranks the event as one entry', async () => {
+    const team = (id, name, yes, over = {}) =>
+      rawMarket({ id, question: `Will the ${name} win Super Bowl 2027?`, groupItemTitle: name, outcomePrices: `["${yes}","${1 - yes}"]`, liquidity: '300', liquidityNum: 300, volumeNum: 1000, ...over })
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const u = new URL(url)
+      if (u.pathname === '/tags/slug/sports') return jsonResponse({ id: '1', slug: 'sports' })
+      if (u.pathname === '/tags/slug/politics') return jsonResponse({ id: '2', slug: 'politics' })
+      if (u.pathname === '/sports') return jsonResponse([])
+      if (u.pathname === '/events' && u.searchParams.get('tag_id') === '1')
+        return jsonResponse([
+          {
+            ...event('900', 'Super Bowl Champion 2027', [
+              team('91', 'Chiefs', 0.18),
+              team('92', 'Bills', 0.12),
+              team('93', 'Eagles', 0.09),
+              team('94', 'Jets', 0.004),
+              team('95', 'Browns', 0.002),
+              team('96', 'Closed team', 0.001, { closed: true }),
+            ]),
+            negRisk: true,
+          },
+          // Not a winner event: still capped at three markets.
+          event('e1', 'Chiefs vs. Bills', [
+            rawMarket({ id: '11', question: 'Chiefs vs. Bills', outcomes: '["Chiefs","Bills"]', volumeNum: 900 }),
+            rawMarket({ id: '12', question: 'Spread: Chiefs (-2.5)', volumeNum: 500 }),
+            rawMarket({ id: '13', question: 'O/U 47.5', volumeNum: 400 }),
+            rawMarket({ id: '14', question: 'Mahomes 300+ yards', volumeNum: 100 }),
+          ]),
+          // A winner event with too little liquidity in total is treated like any other event.
+          { ...event('901', 'Tiny award', [team('81', 'A', 0.5, { liquidityNum: 10 }), team('82', 'B', 0.5, { liquidityNum: 10 })]), negRisk: true },
+        ])
+      if (u.pathname === '/events') return jsonResponse([])
+      return jsonResponse({}, 404)
+    }))
+    await useMarketStore.getState().refresh()
+    const s = useMarketStore.getState()
+    const grouped = s.order.filter((id) => s.markets[id].group)
+    // Every open team is listed, long shots included; the closed one is not.
+    expect(grouped.sort()).toEqual(['91', '92', '93', '94', '95'])
+    expect(s.markets['94'].group).toEqual({ id: '900', title: 'Super Bowl Champion 2027', label: 'Jets', image: null, size: 5 })
+    expect(s.markets['91'].groupVolume).toBe(5000)
+    expect(s.order.filter((id) => ['11', '12', '13', '14'].includes(id)).sort()).toEqual(['11', '12', '13'])
+    expect(s.order).not.toContain('81')
+  })
+
   it('keeps live data (marked stale) when a later refresh fails', async () => {
     useMarketStore.setState({
       source: 'live',
