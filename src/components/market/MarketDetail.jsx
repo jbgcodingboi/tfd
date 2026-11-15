@@ -66,6 +66,15 @@ export default function MarketDetail({ market, side, onSideChange }) {
                 {market.source === 'mock' && <span className="ml-2 rounded bg-surface-3 px-1.5 py-0.5">Demo market</span>}
               </p>
               <h1 className="mt-1 text-xl leading-tight font-bold text-balance sm:text-2xl">{market.title}</h1>
+              {market.group && (
+                <p className="mt-1 text-sm text-muted">
+                  One of {market.group.size ?? 'several'} outcomes in{' '}
+                  <Link to={`/event/${encodeURIComponent(market.group.id)}`} className="text-primary-300 hover:underline">
+                    {market.group.title}
+                  </Link>
+                  .
+                </p>
+              )}
               {resolution ? (
                 <div className="mt-2">
                   <OutcomeBadge outcome={resolution.outcome} labels={market.labels} />

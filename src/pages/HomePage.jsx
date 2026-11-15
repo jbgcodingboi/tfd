@@ -17,6 +17,7 @@ import { useMarketStore } from '../store/marketStore.js'
 import { useResolutionStore } from '../store/resolutionStore.js'
 import { useUiStore } from '../store/uiStore.js'
 import { filterMarkets, sortMarkets } from '../utils/filters.js'
+import { collapseGroups, countEntries } from '../utils/groups.js'
 import { own } from '../utils/safe.js'
 import { ALL_SPORTS, effectiveSport, sportTabs } from '../utils/sports.js'
 
@@ -54,8 +55,9 @@ export default function HomePage() {
   )
   const matched = useMemo(() => filterMarkets(list, { query }), [list, query])
   const counts = useMemo(() => {
-    const counts = { all: matched.length }
-    for (const c of CATEGORIES) counts[c.id] = matched.filter((m) => m.category === c.id).length
+    // A winner event's outcomes count once, as the one card they show as.
+    const counts = { all: countEntries(matched) }
+    for (const c of CATEGORIES) counts[c.id] = countEntries(matched.filter((m) => m.category === c.id))
     return counts
   }, [matched])
   // Sports sub-categories: only those with markets in the current listing are offered,
@@ -68,11 +70,13 @@ export default function HomePage() {
   }, [sport, all, setSport])
   const visible = useMemo(
     () =>
-      sortMarkets(
-        filterMarkets(list, { query, category, sport: activeSport }),
-        sort,
-        (id) => Boolean(own(resolutions, id)),
-        { sportsFirst: category === 'all' && sort === 'volume' },
+      collapseGroups(
+        sortMarkets(
+          filterMarkets(list, { query, category, sport: activeSport }),
+          sort,
+          (id) => Boolean(own(resolutions, id)),
+          { sportsFirst: category === 'all' && sort === 'volume' },
+        ),
       ),
     [list, query, category, activeSport, sort, resolutions],
   )

@@ -92,3 +92,48 @@ describe('golden sevens slot', () => {
     expect(units).toEqual({ 0: 30, 1: 0, 15: 470, 45: 635, 424: 7670, 17392: 123545 })
   })
 })
+
+describe('crash clock', () => {
+  // Polls every 300 ms over a network that takes 40 to 200 ms each way, drawn every frame for 8 seconds.
+  const simulate = (step) => {
+    let seed = 7
+    const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647
+    let clock = { elapsed: 0, at: 0 }
+    let shown = 0
+    let worstBack = 0
+    let worstError = 0
+    const replies = []
+    for (let sent = 0; sent < 8000; sent += 300) {
+      const there = 40 + rand() * 160
+      replies.push({ sentAt: sent, serverElapsed: sent + there, arrives: sent + there + 40 + rand() * 160 })
+    }
+    for (let now = 0; now <= 8000; now += 1000 / 60) {
+      for (const r of replies) {
+        if (r.used || r.arrives > now) continue
+        r.used = true
+        clock = step(clock, r, now)
+      }
+      const t = clock.elapsed + (now - clock.at)
+      worstBack = Math.max(worstBack, shown - t)
+      worstError = Math.max(worstError, Math.abs(t - now))
+      shown = t
+    }
+    return { worstBack, worstError }
+  }
+
+  it('never jumps back noticeably and stays close to the server', () => {
+    const smooth = simulate((clock, r, now) => limbo.syncClock(clock, { serverElapsed: r.serverElapsed, now, sentAt: r.sentAt }))
+    expect(smooth.worstBack).toBeLessThan(15)
+    expect(smooth.worstError).toBeLessThan(150)
+  })
+
+  it('beats taking every answer as is, which jumped back by most of the delay', () => {
+    const naive = simulate((_clock, r, now) => ({ elapsed: r.serverElapsed, at: now }))
+    expect(naive.worstBack).toBeGreaterThan(100)
+  })
+
+  it('takes a new round or a big difference at once', () => {
+    expect(limbo.syncClock({ elapsed: 5000, at: 0 }, { serverElapsed: 0, now: 100, fresh: true })).toEqual({ elapsed: 0, at: 100 })
+    expect(limbo.syncClock({ elapsed: 0, at: 0 }, { serverElapsed: 2000, now: 100, sentAt: 100 })).toEqual({ elapsed: 2000, at: 100 })
+  })
+})

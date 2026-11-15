@@ -94,10 +94,45 @@ async function fetchEvents(params, now) {
   }
 }
 
+/** The most outcomes kept from one winner event (an election can list many long shots). */
+export const MAX_GROUP_OUTCOMES = 100
+
 /**
- * Open, liquid, curated binary markets from one events feed. Each event
- * contributes at most MARKETS_PER_EVENT markets (highest volume first), so a
- * single game with many prop markets can't crowd out the rest.
+ * "Pick the winner" events (a champion, an MVP, an election): Polymarket runs
+ * them as one Yes/No market per outcome, exactly one of which wins, and flags
+ * them as neg risk. Game events (moneyline, spreads, totals) are not.
+ */
+const isWinnerEvent = (ev) => ev?.negRisk === true || ev?.enableNegRisk === true
+
+/**
+ * Every outcome of a winner event, tagged with the event as `group` so the
+ * app can show them together, or null when it doesn't qualify. Long shots are
+ * kept (each outcome only needs a live price); the event as a whole must be
+ * liquid. `groupVolume` is the event's total, used to rank it as one entry.
+ */
+function winnerGroup(ev, markets, now) {
+  const id = ev.id === undefined || ev.id === null ? '' : String(ev.id)
+  if (!isWinnerEvent(ev) || !/^\d{1,15}$/.test(id)) return null
+  const open = markets.filter((m) => isListable(m, 0))
+  if (open.length < 2 || open.reduce((sum, m) => sum + m.liquidity, 0) < MIN_LIQUIDITY) return null
+  const title = typeof ev.title === 'string' ? ev.title.trim().slice(0, 300) : ''
+  const image = typeof ev.image === 'string' && /^https:\/\//.test(ev.image) ? ev.image : null
+  const kept = curate(
+    open.map((m) => ({ ...m, group: { id, title: title || m.eventTitle, label: m.outcomeLabel || m.title, image } })),
+    now,
+  )
+    .sort((a, b) => b.yesPrice - a.yesPrice || b.volume - a.volume)
+    .slice(0, MAX_GROUP_OUTCOMES)
+  if (kept.length < 2) return null
+  const volume = kept.reduce((sum, m) => sum + m.volume, 0)
+  return kept.map((m) => ({ ...m, group: { ...m.group, size: kept.length }, groupVolume: volume }))
+}
+
+/**
+ * Open, liquid, curated binary markets from one events feed. A winner event
+ * keeps every outcome (see winnerGroup); any other event contributes at most
+ * MARKETS_PER_EVENT markets (highest volume first), so a single game with many
+ * prop markets can't crowd out the rest.
  */
 async function fetchFeed({ params, category, league = null }, now) {
   const events = await fetchEvents(params, now)
@@ -106,10 +141,13 @@ async function fetchFeed({ params, category, league = null }, now) {
   for (const ev of events) {
     if (!Array.isArray(ev?.markets)) continue
     const context = { title: ev.title, image: ev.image, endDate: ev.endDate, tags: ev.tags }
-    const markets = ev.markets
-      .map((m) => normalizeGammaMarket({ ...m, events: [context] }, category, { league }))
-      .filter((m) => m && isListable(m, MIN_LIQUIDITY))
-      .sort((a, b) => b.volume - a.volume)
+    const normalized = ev.markets.map((m) => normalizeGammaMarket({ ...m, events: [context] }, category, { league })).filter(Boolean)
+    const group = winnerGroup(ev, normalized, now)
+    if (group) {
+      out.push(...group)
+      continue
+    }
+    const markets = normalized.filter((m) => isListable(m, MIN_LIQUIDITY)).sort((a, b) => b.volume - a.volume)
     out.push(...curate(markets, now).slice(0, MARKETS_PER_EVENT))
   }
   return out
@@ -144,7 +182,20 @@ export async function fetchCatalog({ tagIds = null, now = Date.now() } = {}) {
       byCategory[m.category].push(m)
     }
   })
-  const top = (list, n) => list.sort((a, b) => b.volume - a.volume).slice(0, n)
+  // A winner event counts once, by its total volume, and keeps all of its outcomes.
+  const top = (list, n) => {
+    const units = new Map()
+    for (const m of list) {
+      const key = m.group ? `g:${m.group.id}` : m.id
+      const unit = units.get(key) ?? { volume: m.groupVolume ?? m.volume, markets: [] }
+      unit.markets.push(m)
+      units.set(key, unit)
+    }
+    return [...units.values()]
+      .sort((a, b) => b.volume - a.volume)
+      .slice(0, n)
+      .flatMap((u) => u.markets)
+  }
   return {
     tagIds: ids,
     list: [...top(byCategory.sports, SPORTS_MARKET_LIMIT), ...top(byCategory.politics, POLITICS_MARKET_LIMIT)],

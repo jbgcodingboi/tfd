@@ -139,6 +139,8 @@ export function isChampionshipFuture(m) {
  * between 6% and 95%.
  */
 export function isOddsExempt(m) {
+  // Every outcome of a "pick the winner" event is listed, long shots included (see gamma.js).
+  if (m.group) return true
   const text = `${m.title} ${m.eventTitle ?? ''}`.toLowerCase()
   if (CEASEFIRE.test(text) || ALIENS.test(text)) return true
   if (m.category === 'politics' && AGREEMENT.test(text)) return true

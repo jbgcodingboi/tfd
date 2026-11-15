@@ -167,11 +167,16 @@ export function sportSubcategory(m) {
   return matchText(title) ?? matchText(desc) ?? OTHER_SPORT
 }
 
-/** Market count per sub-category, for Sports markets only. */
+/** Market count per sub-category, for Sports markets only. A winner event's outcomes count once. */
 export function countSports(markets) {
   const counts = {}
+  const groups = new Set()
   for (const m of markets) {
     if (m.category !== 'sports') continue
+    if (m.group) {
+      if (groups.has(m.group.id)) continue
+      groups.add(m.group.id)
+    }
     const id = sportSubcategory(m)
     counts[id] = (counts[id] ?? 0) + 1
   }

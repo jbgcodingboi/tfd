@@ -18,6 +18,7 @@ import { GAME_PATH } from './games/names.js'
 
 const HomePage = lazy(() => import('./pages/HomePage.jsx'))
 const MarketPage = lazy(() => import('./pages/MarketPage.jsx'))
+const EventPage = lazy(() => import('./pages/EventPage.jsx'))
 const PortfolioPage = lazy(() => import('./pages/PortfolioPage.jsx'))
 const LeaderboardPage = lazy(() => import('./pages/LeaderboardPage.jsx'))
 const GamesPage = lazy(() => import('./pages/games/GamesPage.jsx'))
@@ -40,6 +41,7 @@ function AppRoutes() {
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/market/:id" element={<MarketPage />} />
+          <Route path="/event/:id" element={<EventPage />} />
           <Route path="/portfolio" element={<PortfolioPage />} />
           <Route path="/leaderboard" element={<LeaderboardPage />} />
           <Route path="/games" element={<GamesPage />} />

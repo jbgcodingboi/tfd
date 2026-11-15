@@ -235,6 +235,11 @@ anyway, and a round started before a balance reset is dropped. Game records are 
 
 All of these live in `src/utils/curation.js` (with tests) and apply to live data, the snapshot and demo data alike.
 
+- **Winner events**: events where exactly one outcome wins (a champion, an MVP, an election; Polymarket flags them
+  as neg risk) keep every outcome, long shots included, and show as one card with the leaders. The card opens
+  `#/event/<id>`, which lists every outcome with Yes and No prices and the trade panel for the one picked. Each
+  outcome is still its own Yes/No market, so trading and settlement work as for any other market. An event counts
+  once toward the listing limits, by its total volume. Every other event shows at most 3 markets.
 - **Topics**: markets about death, violence, war, crime and arrests, sex or drugs are hidden, since students use
   the site. Whole words only, so team names like the Warriors still pass.
 - **Dates**: markets whose end date has passed are hidden, as are markets ending after June 1, 2027.
