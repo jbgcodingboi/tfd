@@ -34,8 +34,12 @@ const SPARKS = Array.from({ length: 14 }, (_, i) => {
  * The rising curve, sized to its box so text stays crisp on any screen. Time
  * runs across and the multiplier up; both axes stretch as the round climbs so
  * the rocket stays in view on long rounds.
+ *
+ * The curve and rocket follow the exact e^(GROWTH t) curve (flattened at `cap`),
+ * not the multiplier shown in the middle, which is rounded down to the cent:
+ * drawing from the rounded value made the rocket step and its nose flicker.
  */
-export default function CrashChart({ elapsed, mult, phase, result, bet, celebrate, live }) {
+export default function CrashChart({ elapsed, mult, cap = Infinity, phase, result, bet, celebrate, live }) {
   const box = useRef(null)
   const [size, setSize] = useState({ w: 600, h: 300 })
   useEffect(() => {
@@ -51,10 +55,14 @@ export default function CrashChart({ elapsed, mult, phase, result, bet, celebrat
   const crashed = phase === 'done' && !result?.win
   const cashed = phase === 'done' && result?.win
   const flying = phase === 'playing'
+  const curve = (t) => Math.min(cap, Math.exp(GROWTH * t))
+  const top = curve(elapsed)
   const tMax = Math.max(8000, elapsed * 1.18)
-  const mMax = Math.max(2, 1 + (mult - 1) * 1.25)
-  const x = (t) => PAD.l + (t / tMax) * (w - PAD.l - PAD.r)
-  const y = (m) => h - PAD.b - ((m - 1) / (mMax - 1)) * (h - PAD.t - PAD.b)
+  const mMax = Math.max(2, 1 + (top - 1) * 1.25)
+  const plotW = w - PAD.l - PAD.r
+  const plotH = h - PAD.t - PAD.b
+  const x = (t) => PAD.l + (t / tMax) * plotW
+  const y = (m) => h - PAD.b - ((m - 1) / (mMax - 1)) * plotH
 
   const yTicks = useMemo(() => {
     const step = niceStep(mMax - 1, h < 240 ? 3 : 4)
@@ -74,13 +82,14 @@ export default function CrashChart({ elapsed, mult, phase, result, bet, celebrat
   const n = 90
   for (let i = 0; i <= n; i++) {
     const t = (elapsed * i) / n
-    pts.push([x(t), y(Math.min(mult, Math.exp(GROWTH * t)))])
+    pts.push([x(t), y(curve(t))])
   }
   const line = pts.map(([px, py], i) => `${i ? 'L' : 'M'}${px.toFixed(1)} ${py.toFixed(1)}`).join('')
   const area = `${line}L${x(elapsed).toFixed(1)} ${y(1)}L${x(0)} ${y(1)}Z`
   const [hx, hy] = pts[pts.length - 1]
-  const [px, py] = pts[Math.max(0, pts.length - 4)]
-  const angle = (Math.atan2(hy - py, hx - px) * 180) / Math.PI
+  // The rocket points along the curve's slope at its tip (flat once it reaches the cap).
+  const rising = top < cap
+  const angle = (Math.atan2(rising ? -(GROWTH * top * plotH) / (mMax - 1) : 0, plotW / tMax) * 180) / Math.PI
 
   const stroke = crashed ? '#f5703c' : cashed ? '#2fbf71' : 'url(#crash-stroke)'
   const numColor = crashed ? 'var(--color-no)' : cashed ? 'var(--color-yes)' : flying ? heat(mult) : '#fff'
@@ -106,9 +115,10 @@ export default function CrashChart({ elapsed, mult, phase, result, bet, celebrat
             <stop offset="0" stopColor={crashed ? '#f5703c' : cashed ? '#2fbf71' : '#f5b82e'} stopOpacity="0.32" />
             <stop offset="1" stopColor={crashed ? '#f5703c' : cashed ? '#2fbf71' : '#f5b82e'} stopOpacity="0" />
           </linearGradient>
-          <filter id="crash-glow" filterUnits="userSpaceOnUse" x={-40} y={-40} width={w + 80} height={h + 80}>
-            <feGaussianBlur stdDeviation="4" />
-          </filter>
+          <radialGradient id="crash-tip">
+            <stop offset="0" stopColor="#f5b82e" stopOpacity="0.55" />
+            <stop offset="1" stopColor="#f5b82e" stopOpacity="0" />
+          </radialGradient>
         </defs>
         {yTicks.map((m) => (
           <g key={`y${m}`}>
@@ -126,12 +136,14 @@ export default function CrashChart({ elapsed, mult, phase, result, bet, celebrat
         {started && (
           <>
             <path d={area} fill="url(#crash-fill)" />
-            <path d={line} fill="none" stroke={stroke} strokeWidth="9" strokeLinecap="round" strokeLinejoin="round" opacity="0.25" filter="url(#crash-glow)" />
+            {/* A soft glow from wide, faint strokes: a blur filter is redrawn every frame and stutters on phones. */}
+            <path d={line} fill="none" stroke={stroke} strokeWidth="14" strokeLinecap="round" strokeLinejoin="round" opacity="0.08" />
+            <path d={line} fill="none" stroke={stroke} strokeWidth="8" strokeLinecap="round" strokeLinejoin="round" opacity="0.16" />
             <path d={line} fill="none" stroke={stroke} strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
             {flying && (
               <g transform={`translate(${hx} ${hy})`}>
                 <circle r="14" fill="#f5b82e" opacity="0.35" className="crash-halo" />
-                <circle r="11" fill="#f5b82e" opacity="0.45" filter="url(#crash-glow)" />
+                <circle r="18" fill="url(#crash-tip)" />
                 <g transform={`rotate(${angle})`}>
                   {/* A small rocket pointing along the curve. */}
                   <path d="M-12 0 L-19 -4 L-17 0 L-19 4 Z" fill="#ff8a4c" opacity="0.9" />

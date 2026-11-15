@@ -43,6 +43,21 @@ export const isWin = (result, target) => Math.round(result * 100) >= Math.round(
 /** Crash curve: the multiplier after `ms` milliseconds, floored to 2 decimals. */
 export const multiplierAt = (ms) => Math.floor(Math.exp(GROWTH * Math.max(0, ms)) * 100) / 100
 
+/**
+ * The local clock for a running Crash round after an answer from the server: { elapsed, at } means the round
+ * was `elapsed` ms old at performance.now() `at`. The server's elapsed time is already a little old when it
+ * arrives, so half the round trip is added. A big difference (or a new round) is taken at once; a small one is
+ * eased in a fifth at a time, so the rocket never jumps back and forth with each poll.
+ */
+export function syncClock(clock, { serverElapsed, now, sentAt, fresh = false }) {
+  const server = serverElapsed + (sentAt == null ? 0 : Math.max(0, now - sentAt) / 2)
+  const local = clock.elapsed + (now - clock.at)
+  const diff = server - local
+  if (fresh || Math.abs(diff) > 400) return { elapsed: server, at: now }
+  if (Math.abs(diff) > 15) return { elapsed: local + diff * 0.2, at: now }
+  return clock
+}
+
 /** Milliseconds until the curve reaches `mult`. */
 export const timeTo = (mult) => Math.log(Math.max(1, mult)) / GROWTH
 

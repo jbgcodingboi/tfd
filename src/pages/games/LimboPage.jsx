@@ -11,7 +11,7 @@ import ModeTabs from '../../components/games/ModeTabs.jsx'
 import SoundToggle from '../../components/games/SoundToggle.jsx'
 import { DEFAULT_AUTO, useAutoBet } from '../../components/games/useAutoBet.js'
 import { useDocumentTitle } from '../../hooks/useDocumentTitle.js'
-import { clampTarget, formatMult, MAX_RESULT, MIN_TARGET, multiplierAt, RTP, targetForChance, timeTo, winChance } from '../../games/limbo.js'
+import { clampTarget, formatMult, MAX_RESULT, MIN_TARGET, multiplierAt, RTP, syncClock, targetForChance, timeTo, winChance } from '../../games/limbo.js'
 import { GAME_PATH } from '../../games/names.js'
 import { limboSounds } from '../../games/sounds/limbo.js'
 import { crashApi, limboDetail, playLimbo } from '../../services/games/limbo.js'
@@ -327,8 +327,13 @@ function CrashGame() {
   const autoInvalid = autoText !== '' && autoAt === null
   const playing = round.phase === 'playing'
 
-  const take = (r) => {
-    sync.current = { elapsed: r.elapsed ?? 0, at: performance.now() }
+  // Keeps the local round clock in step with the server's (see syncClock).
+  const syncClockTo = (r, sentAt) => {
+    sync.current = syncClock(sync.current, { serverElapsed: r.elapsed ?? 0, now: performance.now(), sentAt, fresh: phase.current !== 'playing' })
+  }
+
+  const take = (r, sentAt) => {
+    syncClockTo(r, sentAt)
     if (r.phase === 'done' && phase.current === 'playing') {
       if (r.result.win) {
         limboSounds.cashout(r.result.cashout)
@@ -345,7 +350,8 @@ function CrashGame() {
 
   // Picks up a round left running (after a reload, say).
   useEffect(() => {
-    crashApi.state().then(take, () => {})
+    const sentAt = performance.now()
+    crashApi.state().then((r) => take(r, sentAt), () => {})
   }, [])
 
   // While a round runs: draw the curve every frame, ask the server about every 300 ms.
@@ -371,8 +377,9 @@ function CrashGame() {
         await sleep(300)
         if (!running) break
         try {
+          const sentAt = performance.now()
           const r = await crashApi.state()
-          if (running) take(r)
+          if (running) take(r, sentAt)
           if (r.phase !== 'playing') break
         } catch {
           // Try again on the next tick.
@@ -391,11 +398,12 @@ function CrashGame() {
     try {
       if (!(bet >= 0.1)) throw new Error('Enter a bet of at least $0.10.')
       if (bet > cash() + 1e-9) throw new Error(`Your balance is ${formatCurrency(cash())}.`)
+      const sentAt = performance.now()
       const r = await crashApi.start({ amount: bet, auto: autoAt })
       limboSounds.launch()
       setLive(false)
       setElapsed(0)
-      take(r)
+      take(r, sentAt)
     } catch (err) {
       toast({ tone: 'error', title: 'Bet not placed', description: err.message })
     } finally {
@@ -418,6 +426,8 @@ function CrashGame() {
   const mult = done ? (round.result.win ? round.result.cashout : round.result.crash) : playing ? Math.min(multiplierAt(elapsed), round.auto ?? Infinity) : 1
   // A finished round is drawn up to its final multiplier, however long ago it ended.
   const shownElapsed = done ? timeTo(mult) : playing ? elapsed : 0
+  // The curve stops at the final multiplier, or flattens at an auto cash-out until the server ends the round.
+  const curveCap = done ? mult : playing && round.auto ? round.auto : Infinity
   const canBet = !busy && !cooling && bet >= 0.1 && bet <= balance
   useSpaceToPlay(() => {
     if (playing) {
@@ -472,7 +482,7 @@ function CrashGame() {
       <section className="card order-1 min-w-0 space-y-4 p-4 sm:p-6 md:order-2" aria-label="Crash">
         <Toolbar crash />
         <HistoryStrip items={historyItems(recent)} label="Recent crash points" empty="Crash points show up here." />
-        <CrashChart elapsed={shownElapsed} mult={mult} phase={round.phase} result={round.result} bet={round.bet ?? bet} celebrate={celebrate} live={live} />
+        <CrashChart elapsed={shownElapsed} mult={mult} cap={curveCap} phase={round.phase} result={round.result} bet={round.bet ?? bet} celebrate={celebrate} live={live} />
         <p className="sr-only" aria-live="polite">
           {done
             ? round.result.win
