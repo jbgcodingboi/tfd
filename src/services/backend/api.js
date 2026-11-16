@@ -205,10 +205,14 @@ export async function serverMarkets({ categories, ids = [] }) {
     .map((r) => ({ ...r.data, id: r.id, yesPrice: Number(r.yes_price), noPrice: Number(r.no_price), closed: r.closed }))
 }
 
-/** Results recorded on the server in the last `days` days, plus any for the given ids. */
-export async function serverResolutions({ days = 14, ids = [] } = {}) {
+/**
+ * Results recorded on the server in the last `days` days, plus any for the
+ * given ids. With `since` (a time in ms) only results from then on are read,
+ * which is how refreshes after the first avoid re-reading the whole list.
+ */
+export async function serverResolutions({ days = 14, ids = [], since: from = null } = {}) {
   const sb = await client()
-  const since = new Date(Date.now() - days * 864e5).toISOString()
+  const since = new Date(from ?? Date.now() - days * 864e5).toISOString()
   const [recent, held] = await Promise.all([
     sb.from('resolutions').select('market_id,outcome,source,title,resolved_at').gte('resolved_at', since).limit(2000),
     ids.length ? sb.from('resolutions').select('market_id,outcome,source,title,resolved_at').in('market_id', ids.slice(0, 200)) : { data: [] },

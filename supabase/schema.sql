@@ -177,6 +177,8 @@ create table if not exists public.resolutions (
   title text not null default '',
   resolved_at timestamptz not null default now()
 );
+-- Every open tab asks for the results since its last look.
+create index if not exists resolutions_resolved_idx on public.resolutions (resolved_at);
 
 -- The public activity feed: trades and game results from every player.
 create table if not exists public.activity (

@@ -24,6 +24,14 @@ export default defineConfig({
   build: {
     target: 'es2020',
     chunkSizeWarningLimit: 600,
+    rollupOptions: {
+      output: {
+        // React, the router and the store library change only when a dependency is updated, so they get
+        // a chunk of their own: after an ordinary deploy returning visitors re-download the site's own
+        // code and keep this one cached. (The Supabase client stays in its own lazy chunk.)
+        manualChunks: (id) => (/[\\/]node_modules[\\/](react|react-dom|scheduler|react-router|react-router-dom|zustand|cookie|set-cookie-parser)[\\/]/.test(id) ? 'vendor' : undefined),
+      },
+    },
   },
   test: {
     environment: 'node',

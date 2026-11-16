@@ -35,7 +35,8 @@
   --color-line-strong: #3a3a42;
   --color-fg: #ededf0;
   --color-muted: #9898a3;
-  --color-subtle: #6c6c76;
+  /* Small print. Light enough to read on every surface above (4.5:1 or better). */
+  --color-subtle: #8a8a94;
 
   /* Outcomes: green for Yes and gains, red-orange for No and losses. */
   --color-yes: #2fbf71;

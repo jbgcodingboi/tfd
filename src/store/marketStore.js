@@ -106,6 +106,26 @@ function addToKnown(known, markets, heldIds) {
 
 let refreshPromise = null
 
+/** Quick markets have ids starting with "q-"; the other markets the server lists are Chaminade's. */
+const isQuickId = (m) => typeof m?.id === 'string' && m.id.startsWith('q-')
+
+/**
+ * Backend mode: Chaminade and Quick markets live in the same table, and each
+ * refresh wants both, so one query serves the two refreshes of a cycle (they
+ * run a moment apart, either side of the Polymarket fetch).
+ */
+let serverListing = null
+function serverHouseAndQuick(heldIds) {
+  const ids = heldIds.filter((id) => id.startsWith('cham-') || id.startsWith('q-'))
+  const key = ids.join(',')
+  if (serverListing && serverListing.key === key && Date.now() - serverListing.at < 15000) return serverListing.promise
+  const promise = backend.serverMarkets({ categories: ['chaminade', 'quick'], ids })
+  serverListing = { key, at: Date.now(), promise }
+  // A failed read is not reused.
+  promise.catch(() => serverListing?.promise === promise && (serverListing = null))
+  return promise
+}
+
 export const useMarketStore = create((set, get) => ({
   status: 'loading',
   source: null,
@@ -147,9 +167,8 @@ export const useMarketStore = create((set, get) => ({
    */
   async refreshHouse(heldIds = []) {
     const house = BACKEND_ENABLED
-      ? await backend
-          .serverMarkets({ categories: ['chaminade'], ids: heldIds.filter((id) => id.startsWith('cham-')) })
-          .then((markets) => ({ markets, results: {} }))
+      ? await serverHouseAndQuick(heldIds)
+          .then((all) => ({ markets: all.filter((m) => !isQuickId(m)), results: {} }))
           .catch(() => null)
       : await fetchHouse().catch(() => null)
     if (!house) return
@@ -168,7 +187,7 @@ export const useMarketStore = create((set, get) => ({
   async refreshQuick(heldIds = []) {
     if (BACKEND_ENABLED) {
       // The server builds, prices and settles Quick markets (see scripts/sync-backend.mjs).
-      const synced = (await backend.serverMarkets({ categories: ['quick'], ids: heldIds.filter((id) => id.startsWith('q-')) }).catch(() => [])).filter(isMarketShape)
+      const synced = (await serverHouseAndQuick(heldIds).then((all) => all.filter(isQuickId)).catch(() => [])).filter(isMarketShape)
       // Hourly crypto odds move by the minute; show the live price the server will charge.
       const markets = await withLiveAbovePrices(synced).catch(() => synced)
       set((s) => ({ quickList: markets, known: addToKnown(s.known, markets, heldIds) }))

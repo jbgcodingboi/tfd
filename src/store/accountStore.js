@@ -78,6 +78,13 @@ let sessionEpoch = 0
 /** Backend mode: bumped whenever a server call hands back a portfolio, so an older read can't overwrite it. */
 let portfolioSeq = 0
 
+/** Backend mode: the portfolio read in flight, if any ({ id, promise }). */
+let remoteLoad = null
+
+/** Backend mode: when the server last sent this player's portfolio (see utils/refresh.js). */
+let portfolioAt = NaN
+export const portfolioAgeMs = () => Date.now() - portfolioAt
+
 /** Closes account dialogs that only make sense while signed in. */
 const closeAccountDialogs = () => useUiStore.setState({ resetOpen: false, deleteOpen: false })
 
@@ -173,15 +180,26 @@ export const useAccountStore = create((set, get) => ({
 
   /** Backend mode: loads the signed-in player's portfolio from the server. Returns new settlements. */
   async loadRemote(user) {
-    const epoch = sessionEpoch
-    const seq = portfolioSeq
-    const raw = await backend.getPortfolio()
-    // Signed out meanwhile, or a trade or game already returned a newer portfolio.
-    if (epoch !== sessionEpoch || seq !== portfolioSeq) return []
-    const portfolio = fromServer(raw)
-    // Guests keep showing as Guest; their placeholder name stays on the server.
-    set({ user: { ...user, username: user.guest ? 'Guest' : (raw.username ?? user.username) }, portfolio })
-    return newSettlements(portfolio)
+    // Signing in fires an event that asks for the same thing at the same moment; one read serves both.
+    if (remoteLoad?.id === user.id) return remoteLoad.promise.then(() => [])
+    const read = (async () => {
+      const epoch = sessionEpoch
+      const seq = portfolioSeq
+      const raw = await backend.getPortfolio()
+      // Signed out meanwhile, or a trade or game already returned a newer portfolio.
+      if (epoch !== sessionEpoch || seq !== portfolioSeq) return []
+      const portfolio = fromServer(raw)
+      // Guests keep showing as Guest; their placeholder name stays on the server.
+      portfolioAt = Date.now()
+      set({ user: { ...user, username: user.guest ? 'Guest' : (raw.username ?? user.username) }, portfolio })
+      return newSettlements(portfolio)
+    })()
+    remoteLoad = { id: user.id, promise: read }
+    try {
+      return await read
+    } finally {
+      if (remoteLoad?.promise === read) remoteLoad = null
+    }
   },
 
   /** Backend mode: re-reads the portfolio (picks up server-side settlements). */
@@ -195,6 +213,7 @@ export const useAccountStore = create((set, get) => ({
   adoptRemote(raw) {
     if (!raw || !get().user) return
     portfolioSeq += 1
+    portfolioAt = Date.now()
     const portfolio = fromServer(raw)
     newSettlements(portfolio)
     set({ portfolio })

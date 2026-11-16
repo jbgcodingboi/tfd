@@ -28,6 +28,12 @@ export const useResolutionStore = create((set, get) => ({
     set({ resolutions })
   },
 
+  /** Backend mode: adds results fetched since the last refresh. Nothing changes (and nothing re-renders) when there are none. */
+  merge(resolutions) {
+    const fresh = Object.entries(resolutions).filter(([id, r]) => isSafeKey(id) && own(get().resolutions, id)?.outcome !== r.outcome)
+    if (fresh.length) set((s) => ({ resolutions: { ...s.resolutions, ...Object.fromEntries(fresh) } }))
+  },
+
   /** Records a resolution once. Returns false if the market was already resolved. */
   resolve(marketId, outcome, { source = 'api', title = '' } = {}) {
     const current = readJSON(KEY, isResolutions, {})
