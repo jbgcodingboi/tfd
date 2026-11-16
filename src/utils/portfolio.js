@@ -37,10 +37,13 @@ function priceFor(position, getPrice) {
   return isFiniteNumber(p) && p >= 0 && p <= 1 ? p : avgPrice(position)
 }
 
-/** Net Worth = cash + sum(shares x current price) over open positions. */
-export function computeNetWorth(cash, positions, getPrice) {
+/** Chips a player has at a Tables seat (backend mode): theirs like cash, until a hand is lost. */
+export const tableChipsOf = (portfolio) => (isFiniteNumber(portfolio?.tableChips) && portfolio.tableChips > 0 ? roundMoney(portfolio.tableChips) : 0)
+
+/** Net Worth = cash + sum(shares x current price) over open positions, plus any chips at a table. */
+export function computeNetWorth(cash, positions, getPrice, tableChips = 0) {
   const values = Object.values(positions).map((pos) => positionValue(pos, priceFor(pos, getPrice)))
-  return sumMoney([cash, ...values])
+  return sumMoney([cash, ...values, tableChips])
 }
 
 function closedTradeStats(history, run) {
@@ -69,10 +72,12 @@ export function computeMetrics(portfolio, getPrice) {
   const invested = sumMoney(costs)
   const marketValue = sumMoney(values)
   const unrealized = sumMoney(pnls)
-  const netWorth = sumMoney([portfolio.cash, marketValue])
+  const tableChips = tableChipsOf(portfolio)
+  const netWorth = sumMoney([portfolio.cash, marketValue, tableChips])
   const stats = closedTradeStats(portfolio.history, portfolio.run)
   return {
     cash: roundMoney(portfolio.cash),
+    tableChips,
     invested,
     marketValue,
     unrealizedPnl: unrealized,

@@ -8,7 +8,7 @@ import { isMockId } from './services/mockData.js'
 import { generateSimTrade } from './services/mockTraders.js'
 import * as backend from './services/backend/api.js'
 import { BACKEND_ENABLED } from './services/backend/config.js'
-import { portfolioKey, useAccountStore } from './store/accountStore.js'
+import { portfolioAgeMs, portfolioKey, useAccountStore } from './store/accountStore.js'
 import { useFeedStore } from './store/feedStore.js'
 import { flush as flushGames } from './store/gameStore.js'
 import { getMarket, isOrphanedDemoId, useMarketStore } from './store/marketStore.js'
@@ -18,6 +18,7 @@ import { useResolutionStore } from './store/resolutionStore.js'
 import { toast } from './store/toastStore.js'
 import { hasEnded } from './utils/curation.js'
 import { formatCurrency, formatSignedCurrency } from './utils/format.js'
+import { portfolioRefreshDue, resolutionsSince } from './utils/refresh.js'
 import { own } from './utils/safe.js'
 import { subscribeToKey } from './utils/storage.js'
 
@@ -100,13 +101,19 @@ function officialResult(id) {
  */
 const lastCheck = new Map()
 let backendBusy = false
+let backendTickAt = 0
+/** Results are read in full once, then only those newer than the last one seen. */
+let resultsSince = null
 async function backendTick() {
-  if (backendBusy) return
+  // The listing lands in up to three parts per refresh; one look at the backend covers them all.
+  if (backendBusy || Date.now() - backendTickAt < 10000) return
   backendBusy = true
+  backendTickAt = Date.now()
   try {
     const ids = heldMarketIds()
-    const resolutions = await backend.serverResolutions({ ids })
-    useResolutionStore.getState().replace(resolutions)
+    const resolutions = await backend.serverResolutions({ ids, since: resultsSince })
+    useResolutionStore.getState().merge(resolutions)
+    resultsSince = resolutionsSince(resultsSince, resolutions, true)
     const account = useAccountStore.getState()
     if (!account.user) return
     const now = Date.now()
@@ -117,7 +124,9 @@ async function backendTick() {
       lastCheck.set(id, now)
       await backend.checkMarket(id).catch(() => false)
     }
-    notifySettled(await account.refreshRemote())
+    // Skipped when the server just sent the portfolio, and mostly skipped when nothing in it can settle.
+    const openPositions = Object.keys(account.portfolio?.positions ?? {}).length
+    if (due.length || portfolioRefreshDue({ ageMs: portfolioAgeMs(), openPositions })) notifySettled(await account.refreshRemote())
   } catch {
     // Try again on the next refresh.
   } finally {

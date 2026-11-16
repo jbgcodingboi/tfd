@@ -6,6 +6,7 @@ import {
   createPortfolio,
   isValidPortfolio,
   resetPortfolio,
+  tableChipsOf,
 } from './portfolio.js'
 import { executeBuy, executeSell } from './trading.js'
 
@@ -71,5 +72,23 @@ describe('reset', () => {
     expect(m.netWorth).toBe(50000)
     expect(m.totalPnl).toBe(0)
     expect(m.closedTrades).toBe(0)
+  })
+})
+
+describe('chips at a table', () => {
+  it('count toward net worth and PnL, but not toward available cash', () => {
+    const p = { ...createPortfolio(0), cash: 98000, tableChips: 2500 }
+    const m = computeMetrics(p, () => 0.5)
+    expect(m.cash).toBe(98000)
+    expect(m.tableChips).toBe(2500)
+    expect(m.netWorth).toBe(100500)
+    expect(m.totalPnl).toBe(500)
+    expect(computeNetWorth(p.cash, p.positions, () => 0.5, tableChipsOf(p))).toBe(100500)
+  })
+  it('are ignored when missing or malformed', () => {
+    expect(tableChipsOf({})).toBe(0)
+    expect(tableChipsOf({ tableChips: 'lots' })).toBe(0)
+    expect(tableChipsOf({ tableChips: -5 })).toBe(0)
+    expect(computeMetrics(createPortfolio(0), () => 0.5).netWorth).toBe(100000)
   })
 })

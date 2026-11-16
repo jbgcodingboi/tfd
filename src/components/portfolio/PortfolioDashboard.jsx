@@ -31,11 +31,16 @@ export default function PortfolioDashboard({ metrics, resetsUsed, games }) {
         <Metric
           big
           label="Net worth"
-          hint="Available cash plus the current value of every open position"
+          hint="Available cash plus the current value of every open position and any chips at a table"
           value={formatCurrency(metrics.netWorth)}
           sub={`${formatSignedCurrency(metrics.totalPnl)} (${formatPercent(metrics.totalPnlPct, { signed: true })}) this run`}
         />
-        <Metric label="Available funds" hint="Uninvested play-money cash" value={formatCurrency(metrics.cash)} sub="Cash balance" />
+        <Metric
+          label="Available funds"
+          hint="Uninvested play-money cash"
+          value={formatCurrency(metrics.cash)}
+          sub={metrics.tableChips > 0 ? `Plus ${formatCurrency(metrics.tableChips)} at a table` : 'Cash balance'}
+        />
         <Metric
           label="Unrealized PnL"
           hint="Sum of (current price - average buy price) x shares over open positions"

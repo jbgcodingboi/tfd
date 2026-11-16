@@ -35,3 +35,4 @@ public/data/
 
 # Built by scripts/build-sync-function.mjs
 supabase/functions/sync/index.ts
+dist-e2e

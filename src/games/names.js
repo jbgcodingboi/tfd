@@ -12,6 +12,8 @@ export const GAME_NAME = {
   // Retired; past rounds keep their name.
   boneyard: 'Boneyard',
   slots: 'Golden Sevens',
+  // The card game between players goes by a plain name too.
+  poker: 'Tables',
 }
 
 /**
@@ -29,6 +31,7 @@ export const GAME_PATH = {
   crash: '/games/rocket',
   slots: '/games/reels',
   boneyard: '/games/reels',
+  poker: '/games/tables',
 }
 
 /** The page for a game id, or the lobby for an unknown one. */

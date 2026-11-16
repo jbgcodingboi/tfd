@@ -1,20 +1,17 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useState } from 'react'
 import { HashRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import AppEffects from './AppEffects.jsx'
-import AuthModal from './components/AuthModal.jsx'
 import Footer from './components/layout/Footer.jsx'
 import Header from './components/layout/Header.jsx'
-import RecoveryCodeModal from './components/RecoveryCodeModal.jsx'
-import ResetBalanceModal from './components/ResetBalanceModal.jsx'
 import ErrorBoundary from './components/ui/ErrorBoundary.jsx'
 import { PageSkeleton } from './components/ui/Skeleton.jsx'
 import Toaster from './components/ui/Toaster.jsx'
 import ScrollToTop from './components/layout/ScrollToTop.jsx'
 import CornerNotice from './components/legal/CornerNotice.jsx'
-import DeleteAccountModal from './components/DeleteAccountModal.jsx'
 import FeedbackTab from './components/FeedbackTab.jsx'
 import TermsGate from './components/legal/TermsGate.jsx'
 import { GAME_PATH } from './games/names.js'
+import { useUiStore } from './store/uiStore.js'
 
 const HomePage = lazy(() => import('./pages/HomePage.jsx'))
 const MarketPage = lazy(() => import('./pages/MarketPage.jsx'))
@@ -30,14 +27,42 @@ const MinesPage = lazy(() => import('./pages/games/MinesPage.jsx'))
 const ChickenPage = lazy(() => import('./pages/games/ChickenPage.jsx'))
 const LimboPage = lazy(() => import('./pages/games/LimboPage.jsx'))
 const SlotsPage = lazy(() => import('./pages/games/SlotsPage.jsx'))
+const TablesPage = lazy(() => import('./pages/games/TablesPage.jsx'))
 const TermsPage = lazy(() => import('./pages/TermsPage.jsx'))
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage.jsx'))
+const AuthModal = lazy(() => import('./components/AuthModal.jsx'))
+const ResetBalanceModal = lazy(() => import('./components/ResetBalanceModal.jsx'))
+const DeleteAccountModal = lazy(() => import('./components/DeleteAccountModal.jsx'))
+const RecoveryCodeModal = lazy(() => import('./components/RecoveryCodeModal.jsx'))
+
+/**
+ * The account dialogs (log in, reset, delete, recovery code). Most visits never
+ * open one, so their code is fetched the first time one is asked for; after
+ * that they stay mounted, which lets them animate closed.
+ */
+function AccountDialogs() {
+  const wanted = useUiStore((s) => s.auth.open || s.resetOpen || s.deleteOpen || Boolean(s.recovery))
+  const [loaded, setLoaded] = useState(false)
+  if (wanted && !loaded) setLoaded(true)
+  if (!loaded) return null
+  return (
+    <Suspense fallback={null}>
+      <AuthModal />
+      <ResetBalanceModal />
+      <DeleteAccountModal />
+      <RecoveryCodeModal />
+    </Suspense>
+  )
+}
 
 function AppRoutes() {
   const { pathname } = useLocation()
   return (
-    <ErrorBoundary key={pathname}>
-      <Suspense fallback={<PageSkeleton />}>
+    // The Suspense boundary sits outside the keyed error boundary, so it is not remounted on every
+    // navigation: React then keeps the current page up while the next page's code arrives (a few
+    // milliseconds once cached) instead of flashing the skeleton, which it holds for 300 ms once shown.
+    <Suspense fallback={<PageSkeleton />}>
+      <ErrorBoundary key={pathname}>
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/market/:id" element={<MarketPage />} />
@@ -54,6 +79,8 @@ function AppRoutes() {
           <Route path={GAME_PATH.limbo} element={<LimboPage key="limbo" />} />
           <Route path={GAME_PATH.crash} element={<LimboPage key="crash" crash />} />
           <Route path={GAME_PATH.slots} element={<SlotsPage />} />
+          <Route path={GAME_PATH.poker} element={<TablesPage />} />
+          <Route path={`${GAME_PATH.poker}/:tableId`} element={<TablesPage />} />
           {/* Old addresses named after each game (and the retired Boneyard) still land on the right page. */}
           {Object.entries(GAME_PATH).map(([game, to]) => (
             <Route key={game} path={`/games/${game}`} element={<Navigate to={to} replace />} />
@@ -61,8 +88,8 @@ function AppRoutes() {
           <Route path="/terms" element={<TermsPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
-      </Suspense>
-    </ErrorBoundary>
+      </ErrorBoundary>
+    </Suspense>
   )
 }
 
@@ -85,10 +112,7 @@ export default function App() {
         </main>
         <Footer />
       </div>
-      <AuthModal />
-      <ResetBalanceModal />
-      <DeleteAccountModal />
-      <RecoveryCodeModal />
+      <AccountDialogs />
       <Toaster />
       <CornerNotice />
       <FeedbackTab />

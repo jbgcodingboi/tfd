@@ -105,22 +105,28 @@ function GameStats({ game }) {
   )
 }
 
-/** Layout for a game page: title, the game, and a side column with funds and history. */
-export default function GameShell({ game, title, subtitle, children, rules }) {
+/**
+ * Layout for a game page: title, the game, and a side column with funds and
+ * history. `compact` keeps the heading for screen readers only, for a game
+ * that needs the whole screen (the page then shows its own way back).
+ */
+export default function GameShell({ game, title, subtitle, children, rules, compact = false }) {
   const user = useAccountStore((s) => s.user)
   // Pays out anything still animating when the player leaves the page.
   useEffect(() => () => flush(game), [game])
   return (
-    <div className="mx-auto max-w-7xl px-4 py-6">
-      <Link to="/games" className="inline-flex items-center gap-1 text-sm text-muted hover:text-fg">
-        <ChevronLeftIcon /> All games
-      </Link>
-      <div className="mt-3">
-        <h1 className="text-2xl font-bold tracking-tight">{title}</h1>
-        <p className="mt-1 text-sm text-muted">{subtitle}</p>
+    <div className={`mx-auto max-w-7xl px-4 ${compact ? 'py-2 sm:py-4' : 'py-6'}`}>
+      <div className={compact ? 'sr-only' : ''}>
+        <Link to="/games" className="inline-flex items-center gap-1 text-sm text-muted hover:text-fg">
+          <ChevronLeftIcon /> All games
+        </Link>
+        <div className="mt-3">
+          <h1 className="text-2xl font-bold tracking-tight">{title}</h1>
+          <p className="mt-1 text-sm text-muted">{subtitle}</p>
+        </div>
       </div>
       {user ? (
-        <div className="mt-5 grid gap-6 lg:grid-cols-[minmax(0,1fr)_300px]">
+        <div className={`grid gap-6 lg:grid-cols-[minmax(0,1fr)_300px] ${compact ? '' : 'mt-5'}`}>
           <div className="min-w-0 space-y-4">
             {children}
             {rules && (

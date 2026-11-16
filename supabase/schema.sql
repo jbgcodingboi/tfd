@@ -95,10 +95,10 @@ create table if not exists public.game_rounds (
 -- Only rebuilt when the game list changes, so a re-run doesn't lock and recheck the whole table.
 do $$ begin
   if coalesce((select pg_get_constraintdef(oid) from pg_constraint
-      where conrelid = 'public.game_rounds'::regclass and conname = 'game_rounds_game_check'), '') not like '%slots%' then
+      where conrelid = 'public.game_rounds'::regclass and conname = 'game_rounds_game_check'), '') not like '%poker%' then
     alter table public.game_rounds drop constraint if exists game_rounds_game_check;
     alter table public.game_rounds add constraint game_rounds_game_check
-      check (game in ('roulette', 'blackjack', 'plinko', 'dice', 'mines', 'chicken', 'limbo', 'crash', 'boneyard', 'slots'));
+      check (game in ('roulette', 'blackjack', 'plinko', 'dice', 'mines', 'chicken', 'limbo', 'crash', 'boneyard', 'slots', 'poker'));
   end if;
 end $$;
 create index if not exists game_rounds_user_idx on public.game_rounds (user_id, created_at desc);
@@ -177,6 +177,8 @@ create table if not exists public.resolutions (
   title text not null default '',
   resolved_at timestamptz not null default now()
 );
+-- Every open tab asks for the results since its last look.
+create index if not exists resolutions_resolved_idx on public.resolutions (resolved_at);
 
 -- The public activity feed: trades and game results from every player.
 create table if not exists public.activity (
@@ -214,6 +216,102 @@ create table if not exists public.feedback (
 create index if not exists feedback_created_idx on public.feedback (created_at desc);
 create index if not exists feedback_user_idx on public.feedback (user_id);
 create index if not exists feedback_new_idx on public.feedback (created_at) where status = 'new';
+
+-- Tables (multiplayer poker; see the poker section further down). One public row
+-- per table holds the state every player and spectator may see. Seats, hole
+-- cards and the deck live in the private schema, which the API doesn't expose,
+-- so no select, filter or Realtime message can ever return a hidden card.
+create table if not exists public.poker_tables (
+  id bigint generated always as identity primary key,
+  stake text not null,
+  small_blind bigint not null check (small_blind > 0),
+  big_blind bigint not null check (big_blind >= small_blind),
+  min_buy bigint not null,
+  max_buy bigint not null,
+  max_seats int not null default 6 check (max_seats between 2 and 6),
+  seated int not null default 0,
+  -- Goes up with every change, so clients can drop anything older than what they have.
+  version bigint not null default 0,
+  hand_no bigint not null default 0,
+  -- When the table next needs a push: the end of a player's turn, the next deal, or an idle seat's removal.
+  deadline timestamptz,
+  state jsonb not null default '{}',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists poker_tables_deadline_idx on public.poker_tables (deadline) where deadline is not null;
+create index if not exists poker_tables_stake_idx on public.poker_tables (stake);
+
+create table if not exists private.poker_seats (
+  table_id bigint not null references public.poker_tables (id) on delete cascade,
+  seat int not null check (seat between 0 and 5),
+  -- Null once the account is deleted: the seat is folded and cleared when the hand ends.
+  user_id uuid references public.portfolios (user_id) on delete set null,
+  username text not null,
+  -- The portfolio run the chips were bought in. Chips never cross a balance reset.
+  run int not null,
+  stack bigint not null check (stack >= 0),
+  sitting_out boolean not null default false,
+  away_since timestamptz,
+  leaving boolean not null default false,
+  timeouts int not null default 0,
+  in_hand boolean not null default false,
+  folded boolean not null default false,
+  all_in boolean not null default false,
+  -- Chips put in on this betting round, and over the whole hand.
+  bet bigint not null default 0 check (bet >= 0),
+  committed bigint not null default 0 check (committed >= 0),
+  -- Whether the player has acted since the last full raise, and the bet they faced or made then.
+  acted boolean not null default false,
+  acted_level bigint not null default 0,
+  hole text[],
+  hole_idx int[],
+  hand_rank int[],
+  shown boolean not null default false,
+  won bigint not null default 0,
+  last_action text,
+  joined_at timestamptz not null default now(),
+  -- The last time this player's browser asked about the table. A seat nobody is behind is freed between hands.
+  seen_at timestamptz not null default now(),
+  primary key (table_id, seat)
+);
+-- One seat per player across every table.
+create unique index if not exists poker_seats_user_idx on private.poker_seats (user_id) where user_id is not null;
+
+create table if not exists private.poker_hands (
+  table_id bigint primary key references public.poker_tables (id) on delete cascade,
+  hand_no bigint not null,
+  street text not null check (street in ('preflop', 'flop', 'turn', 'river', 'done', 'idle')),
+  deck text[] not null,
+  salts text[] not null,
+  commits text[] not null,
+  deck_hash text not null,
+  -- Index of the last card dealt (hole cards first, then burn and board cards).
+  next_card int not null,
+  board text[] not null default '{}',
+  board_idx int[] not null default '{}',
+  button int not null,
+  sb_seat int,
+  bb_seat int,
+  to_act int,
+  turn int not null default 0,
+  current_bet bigint not null default 0,
+  last_raise bigint not null,
+  aggressor int,
+  runout int not null default 0,
+  result jsonb,
+  started_at timestamptz not null default now()
+);
+
+-- The last finished hand at each table, for the fairness check (see poker_proof).
+create table if not exists private.poker_proofs (
+  table_id bigint primary key references public.poker_tables (id) on delete cascade,
+  hand_no bigint not null,
+  deck_hash text not null,
+  commits text[] not null,
+  reveals jsonb not null,
+  holes jsonb not null
+);
 
 create table if not exists private.rate_limits (
   user_id uuid not null,
@@ -304,9 +402,23 @@ grant select (id, username, kind, market_id, market_title, side, side_label, sha
 revoke select on public.profiles from anon, authenticated;
 grant select (id, username, is_guest) on public.profiles to anon, authenticated;
 
+-- Tables: anyone may read the public state of a table; nothing else about a hand is reachable.
+alter table public.poker_tables enable row level security;
+drop policy if exists "tables are public" on public.poker_tables;
+create policy "tables are public" on public.poker_tables for select using (true);
+revoke all on public.poker_tables from anon, authenticated;
+grant select (id, stake, small_blind, big_blind, min_buy, max_buy, max_seats, seated, version, hand_no, deadline, state, updated_at)
+  on public.poker_tables to anon, authenticated;
+revoke all on all tables in schema private from public, anon, authenticated;
+
 -- Live feed over Supabase Realtime.
 do $$ begin
   alter publication supabase_realtime add table public.activity;
+exception when others then null;
+end $$;
+-- Table state changes, so players see each other act without polling.
+do $$ begin
+  alter publication supabase_realtime add table public.poker_tables;
 exception when others then null;
 end $$;
 
@@ -573,6 +685,8 @@ $$;
 create or replace function private.equity(p_user uuid) returns numeric
 language sql stable set search_path = '' as $$
   select pf.cash + coalesce((select sum(private.position_value(p)) from public.positions p where p.user_id = p_user), 0)
+    -- Chips at a table (the stack plus anything in the pot this hand) are still the player's until a hand is lost.
+    + coalesce((select s.stack + s.committed from private.poker_seats s where s.user_id = p_user and s.run = pf.run), 0)
   from public.portfolios pf where pf.user_id = p_user
 $$;
 
@@ -611,6 +725,7 @@ language sql stable set search_path = '' as $$
     'runStartCash', pf.run_start_cash,
     'resetsUsed', pf.resets_used,
     'tradeCount', pf.trade_count,
+    'tableChips', coalesce((select s.stack + s.committed from private.poker_seats s where s.user_id = p_user and s.run = pf.run), 0),
     'createdAt', private.ms(pf.created_at),
     'positions', coalesce((
       select jsonb_object_agg(p.market_id || ':' || p.side, jsonb_build_object(
@@ -993,11 +1108,13 @@ begin
     'portfolio', private.portfolio_json(v_user));
 end $$;
 
-/** Starts a new run at $50,000: open positions and any blackjack hand are cleared. */
+/** Starts a new run at $50,000: open positions, any blackjack hand and a seat at a table (with its chips) are cleared. */
 create or replace function public.reset_balance() returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare v_user uuid := private.uid(); pf public.portfolios; cleared int; last_reset timestamptz;
 begin
+  -- Before the portfolio lock: table first, then portfolio, the same order every Tables call uses.
+  perform private.poker_evict(v_user);
   select * into pf from public.portfolios where user_id = v_user for update;
   -- A short wait between resets (5 minutes), so resetting can't be hammered in a loop.
   select max(created_at) into last_reset from public.history where user_id = v_user and type = 'reset';
@@ -1032,6 +1149,8 @@ declare v_user uuid := private.uid();
 begin
   perform private.rate_limit(v_user, 'delete', 5);
   if upper(trim(coalesce(p_confirm, ''))) <> 'DELETE' then return jsonb_build_object('error', 'Type DELETE to confirm.'); end if;
+  -- Folds any hand in progress, so the table carries on without them.
+  perform private.poker_evict(v_user);
   delete from private.rate_limits where user_id = v_user;
   delete from auth.users where id = v_user;
   delete from private.leaderboard_cache;
@@ -1125,16 +1244,28 @@ end $$;
 -- Games: shared money handling
 -- ---------------------------------------------------------------------------
 
-create or replace function private.game_round(p_user uuid, p_run int, p_game text, p_staked numeric, p_returned numeric, p_detail text) returns void
+/**
+ * Logs a finished round and keeps the running totals, without moving money.
+ * Tables calls it directly: a hand's winnings stay in the player's stack at
+ * the table and only reach cash when they leave.
+ */
+create or replace function private.game_record(p_user uuid, p_run int, p_game text, p_staked numeric, p_returned numeric, p_detail text) returns void
 language plpgsql volatile set search_path = '' as $$
 begin
-  update public.portfolios set cash = cash + p_returned, updated_at = now() where user_id = p_user;
   insert into public.game_rounds (user_id, run, game, staked, returned, net, detail)
   values (p_user, p_run, p_game, p_staked, p_returned, p_returned - p_staked, p_detail);
   insert into private.game_totals as t (user_id, run, game, rounds, wagered, net, best)
   values (p_user, p_run, p_game, 1, p_staked, p_returned - p_staked, p_returned - p_staked)
   on conflict (user_id, run, game) do update set
     rounds = t.rounds + 1, wagered = t.wagered + excluded.wagered, net = t.net + excluded.net, best = greatest(t.best, excluded.best);
+end $$;
+
+/** Pays a finished round into cash and logs it. */
+create or replace function private.game_round(p_user uuid, p_run int, p_game text, p_staked numeric, p_returned numeric, p_detail text) returns void
+language plpgsql volatile set search_path = '' as $$
+begin
+  update public.portfolios set cash = cash + p_returned, updated_at = now() where user_id = p_user;
+  perform private.game_record(p_user, p_run, p_game, p_staked, p_returned, p_detail);
 end $$;
 
 create or replace function private.game_activity(p_user uuid, p_game text, p_staked numeric, p_net numeric, p_detail text) returns void
@@ -1600,12 +1731,17 @@ language sql stable set search_path = '' as $$
     from private.game_totals g join public.portfolios p on p.user_id = g.user_id and g.run = p.run
     where g.rounds > 0 order by g.user_id, g.rounds desc
   ),
+  -- Chips sitting at a table count toward net worth, like cash.
+  chips as (
+    select s.user_id, s.stack + s.committed as chips from private.poker_seats s join public.portfolios p on p.user_id = s.user_id and p.run = s.run
+  ),
   rows as (
     select pf.*, coalesce(pos.value, 0) as value, coalesce(pos.cost, 0) as cost, coalesce(pos.open, 0) as open,
-      pf.cash + coalesce(pos.value, 0) as net_worth, closed.wins, closed.total,
+      pf.cash + coalesce(pos.value, 0) + coalesce(chips.chips, 0) as net_worth, closed.wins, closed.total,
       coalesce(games.rounds, 0) as g_rounds, coalesce(games.net, 0) as g_net, coalesce(games.wagered, 0) as g_wagered,
       coalesce(games.best, 0) as g_best, fav.game as fav
     from pf left join pos using (user_id) left join closed using (user_id) left join games using (user_id) left join fav using (user_id)
+      left join chips using (user_id)
   )
   select coalesce(jsonb_agg(jsonb_build_object(
     'id', user_id, 'name', username, 'sim', false,
@@ -2466,6 +2602,996 @@ begin
 end $$;
 
 -- ---------------------------------------------------------------------------
+-- Tables: live No-Limit Texas Hold'em between players
+--
+-- Shown on the site as "Tables" (src/games/names.js). Rounds are recorded
+-- under the game id 'poker'. Play money only, no rake.
+--
+-- THE RULE SET
+--
+-- Seats and stakes
+--   * Cash tables with 2 to 6 seats at fixed stakes (private.poker_stakes).
+--     Chips are whole dollars. A buy-in is 20 to 100 big blinds and moves
+--     from cash to the table stack; leaving moves the stack back.
+--   * One seat per player across all tables. Guests can watch but not sit:
+--     a guest account is free and unlimited, so a seat for guests would let
+--     anyone pour fresh $100,000 balances into one real account.
+--   * A hand is dealt when at least two seated players have chips and are
+--     not sitting out. A player who sits down, comes back or adds chips
+--     during a hand joins the next one. Nobody posts a dead blind.
+--
+-- Button and blinds
+--   * Moving button: each hand the button goes to the next player being dealt
+--     in, clockwise from where it was (the first hand's button is random).
+--     The small blind is the next player after the button and the big blind
+--     the next after that.
+--   * Heads-up, the button posts the small blind, acts first before the flop
+--     and last on every later round.
+--   * A player with fewer chips than their blind posts what they have and is
+--     all-in. The bet to call is still the full big blind.
+--
+-- Betting
+--   * Before the flop the first player after the big blind acts first, and
+--     the big blind may raise when everyone only called. After the flop the
+--     first player after the button who is still in and not all-in acts first.
+--   * Fold, check (nothing to call), call (all-in for less is allowed), bet
+--     or raise. Amounts are the total a player has in on this round.
+--   * The smallest bet is the big blind. The smallest raise adds at least the
+--     size of the last full bet or raise on this round. A player may always
+--     go all-in for less.
+--   * An all-in raise smaller than a full raise does not reopen the betting:
+--     a player who already acted may raise again only when the bet has gone
+--     up by at least a full raise since they acted (so several short all-ins
+--     that add up to a full raise do reopen it). Players who have not acted
+--     yet can still raise, by at least the last full raise on top of the bet.
+--   * A raise is not offered when every other player still in is all-in.
+--   * A round ends when everyone still in and not all-in has acted and
+--     matched the bet. A bet nobody called is returned to the bettor.
+--   * When all but one player has folded, the last one wins the pot without
+--     showing. When at most one player still has chips to bet, the rest of
+--     the board is dealt at once and every hand still in is turned face up.
+--
+-- Pots and showdown
+--   * Side pots: each all-in amount caps a pot. A pot goes to the best hand
+--     among the players who put the full amount for it in. Folded players'
+--     chips stay in the pots they paid into.
+--   * Best five cards from seven. Ties split the pot; an odd chip goes to the
+--     first winner clockwise from the button.
+--   * Showing order: the last player to bet or raise on the river shows
+--     first, or the first player after the button when the river was checked.
+--     Going clockwise, a player shows a hand that wins or ties any pot, or
+--     that is at least as good as the best one shown so far; otherwise it is
+--     mucked and nobody ever sees it.
+--
+-- Clock
+--   * Every turn has a deadline (private.poker_k). A player who runs out of
+--     time checks if that is free and folds otherwise. Two timeouts in a row
+--     sit the player out; from then on they are folded at once until they
+--     come back. A player who stays out for three minutes, or stays at zero
+--     chips that long, is removed and their stack returned to cash. So is a
+--     player whose browser has not asked about the table for three minutes
+--     (checked between hands), so nobody holds a seat they have walked away from.
+--   * There is no server process. Every call that touches a table first
+--     plays out any turn whose deadline has passed (private.poker_advance),
+--     each one timed from the deadline before it, exactly as a clock running
+--     on time would have. Clients call poker_tick when a deadline they can
+--     see passes, and a once-a-minute pg_cron job (private.poker_sweep)
+--     does the same for tables nobody is looking at.
+--
+-- Fairness
+--   * The deck is shuffled with a cryptographic RNG (private.rand_int).
+--     Before any card is dealt each of the 52 cards is sealed as
+--     sha256("<salt>:<card>") with its own random salt, and the hash of all 52
+--     seals is published with the hand. After the hand, poker_proof gives the
+--     seals plus the salt of every card that was shown (and, to each player,
+--     of their own two), so anyone can check the cards were fixed before the
+--     betting started. Mucked hands, burn cards and the rest of the deck stay
+--     sealed for good.
+--
+-- What a client can see: public.poker_tables.state (built by poker_publish
+-- from an explicit list of fields) and, from poker_state, their own two
+-- cards. Other players' cards appear only once shown at a showdown.
+-- ---------------------------------------------------------------------------
+
+/** Table timings in seconds, and how many timeouts in a row sit a player out. */
+create or replace function private.poker_k(p_key text) returns int
+language sql immutable set search_path = '' as $$
+  select case p_key
+    when 'turn' then 25       -- time to act
+    when 'pause' then 6       -- a finished hand stays up this long before the next deal
+    when 'runout' then 4      -- extra time when the board was dealt out after an all-in
+    when 'start' then 3       -- countdown once a second player is ready
+    when 'away' then 180      -- sitting out (or out of chips) this long frees the seat
+    when 'timeouts' then 2    -- timeouts in a row before a player is sat out
+    when 'grace' then 1       -- a move arriving this late still counts
+  end
+$$;
+
+create or replace function private.poker_stakes() returns table (stake text, small_blind bigint, big_blind bigint, min_buy bigint, max_buy bigint)
+language sql immutable set search_path = '' as $$
+  values ('micro', 1::bigint, 2::bigint, 40::bigint, 200::bigint), ('low', 5, 10, 200, 1000), ('mid', 25, 50, 1000, 5000), ('high', 100, 200, 4000, 20000)
+$$;
+
+-- Hand evaluation ---------------------------------------------------------------
+-- Cards are two characters: a rank from 23456789TJQKA and a suit from shdc.
+-- A hand's strength is an array that compares the way hands do: the category
+-- (8 straight flush ... 0 high card), then the ranks that break ties, highest
+-- first. src/games/poker.js computes the same array for the labels on screen.
+
+/** The top card of the best straight among the ranks present (p[2..14] > 0), or 0. The ace also plays low. */
+create or replace function private.poker_straight(p int[]) returns int
+language plpgsql immutable set search_path = '' as $$
+declare h int;
+begin
+  for h in reverse 14..6 loop
+    if p[h] > 0 and p[h - 1] > 0 and p[h - 2] > 0 and p[h - 3] > 0 and p[h - 4] > 0 then return h; end if;
+  end loop;
+  if p[14] > 0 and p[2] > 0 and p[3] > 0 and p[4] > 0 and p[5] > 0 then return 5; end if;
+  return 0;
+end $$;
+
+/** The strength of the best five-card hand among 5 to 7 cards. */
+create or replace function private.poker_rank(p_cards text[]) returns int[]
+language plpgsql immutable set search_path = '' as $$
+declare cnt int[] := array_fill(0, array[14]); suits int[] := array_fill(0, array[4]); fl int[] := array_fill(0, array[14]);
+  c text; r int; s int; fs int := 0; sh int; quad int := 0; trips int[] := '{}'; pairs int[] := '{}'; singles int[] := '{}'; top int[] := '{}';
+begin
+  if coalesce(array_length(p_cards, 1), 0) not between 5 and 7 then raise exception 'A hand is 5 to 7 cards.'; end if;
+  foreach c in array p_cards loop
+    if c is null or c !~ '^[2-9TJQKA][shdc]$' then raise exception 'Bad card %.', c; end if;
+    r := position(substr(c, 1, 1) in '23456789TJQKA') + 1;
+    s := position(substr(c, 2, 1) in 'shdc');
+    cnt[r] := cnt[r] + 1;
+    suits[s] := suits[s] + 1;
+  end loop;
+  for s in 1..4 loop
+    if suits[s] >= 5 then fs := s; end if;
+  end loop;
+  if fs > 0 then
+    foreach c in array p_cards loop
+      if position(substr(c, 2, 1) in 'shdc') = fs then fl[position(substr(c, 1, 1) in '23456789TJQKA') + 1] := 1; end if;
+    end loop;
+    sh := private.poker_straight(fl);
+    if sh > 0 then return array[8, sh, 0, 0, 0, 0]; end if;
+  end if;
+  for r in reverse 14..2 loop
+    if cnt[r] = 4 then quad := r;
+    elsif cnt[r] = 3 then trips := trips || r;
+    elsif cnt[r] = 2 then pairs := pairs || r;
+    elsif cnt[r] = 1 then singles := singles || r;
+    end if;
+  end loop;
+  if quad > 0 then
+    return array[7, quad, (select max(x) from generate_series(2, 14) x where x <> quad and cnt[x] > 0), 0, 0, 0];
+  end if;
+  if coalesce(array_length(trips, 1), 0) > 0 and (array_length(trips, 1) > 1 or coalesce(array_length(pairs, 1), 0) > 0) then
+    return array[6, trips[1], greatest(coalesce(trips[2], 0), coalesce(pairs[1], 0)), 0, 0, 0];
+  end if;
+  if fs > 0 then
+    for r in reverse 14..2 loop
+      if fl[r] > 0 and coalesce(array_length(top, 1), 0) < 5 then top := top || r; end if;
+    end loop;
+    return array[5] || top;
+  end if;
+  sh := private.poker_straight(cnt);
+  if sh > 0 then return array[4, sh, 0, 0, 0, 0]; end if;
+  if coalesce(array_length(trips, 1), 0) > 0 then return array[3, trips[1], singles[1], singles[2], 0, 0]; end if;
+  if coalesce(array_length(pairs, 1), 0) >= 2 then
+    return array[2, pairs[1], pairs[2], greatest(coalesce(pairs[3], 0), coalesce(singles[1], 0)), 0, 0];
+  end if;
+  if coalesce(array_length(pairs, 1), 0) = 1 then return array[1, pairs[1], singles[1], singles[2], singles[3], 0]; end if;
+  return array[0, singles[1], singles[2], singles[3], singles[4], singles[5]];
+end $$;
+
+create or replace function private.poker_rank_name(p int[]) returns text
+language sql immutable set search_path = '' as $$
+  select case p[1]
+    when 8 then case when p[2] = 14 then 'a royal flush' else 'a straight flush' end
+    when 7 then 'four of a kind' when 6 then 'a full house' when 5 then 'a flush' when 4 then 'a straight'
+    when 3 then 'three of a kind' when 2 then 'two pair' when 1 then 'a pair' else 'high card' end
+$$;
+
+/** A freshly shuffled deck: Fisher-Yates driven by the cryptographic, unbiased private.rand_int. */
+create or replace function private.poker_shuffle() returns text[]
+language plpgsql volatile set search_path = '' as $$
+declare cards text[] := '{}'; r text; s text; i int; j int; tmp text;
+begin
+  foreach s in array array['s', 'h', 'd', 'c'] loop
+    foreach r in array array['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'] loop
+      cards := cards || (r || s);
+    end loop;
+  end loop;
+  for i in reverse 52..2 loop
+    j := private.rand_int(i) + 1;
+    tmp := cards[i];
+    cards[i] := cards[j];
+    cards[j] := tmp;
+  end loop;
+  return cards;
+end $$;
+
+-- The engine. Every function here expects the caller to hold the table's row
+-- lock (select ... for update on public.poker_tables), which is what makes two
+-- moves, two tabs or a move and a timeout take turns instead of racing.
+-- `p_base` is the moment an event happened: now() for a player's own move, or
+-- the deadline that ran out, so late pushes replay the table on schedule.
+
+/** What the player to act may do: chips to call, whether a raise is open, and the smallest and largest total bet. */
+create or replace function private.poker_options(p_table bigint, p_seat int, out to_call bigint, out can_raise boolean, out min_to bigint, out max_to bigint)
+language plpgsql stable set search_path = '' as $$
+declare h private.poker_hands; s private.poker_seats; v_others int; v_bet bigint;
+begin
+  select * into h from private.poker_hands where table_id = p_table;
+  select * into s from private.poker_seats where table_id = p_table and seat = p_seat;
+  select count(*) filter (where not all_in), coalesce(max(bet), 0) into v_others, v_bet
+    from private.poker_seats where table_id = p_table and in_hand and not folded and seat <> p_seat;
+  -- Against players who are all all-in, there is only their largest bet to match (a short big blind, say), not the nominal one.
+  v_bet := case when v_others = 0 then least(h.current_bet, v_bet) else h.current_bet end;
+  to_call := least(greatest(v_bet - s.bet, 0), s.stack);
+  max_to := s.bet + s.stack;
+  min_to := least(h.current_bet + h.last_raise, max_to);
+  can_raise := max_to > h.current_bet and v_others > 0 and (not s.acted or h.current_bet - s.acted_level >= h.last_raise);
+end $$;
+
+/**
+ * Applies one move for a seat. Returns null when it was applied, or the
+ * reason it can't be (nothing is changed then). Whose turn it is and what
+ * happens next are the caller's business (see poker_progress).
+ */
+create or replace function private.poker_apply(p_table bigint, p_seat int, p_action text, p_amount numeric) returns text
+language plpgsql volatile set search_path = '' as $$
+declare h private.poker_hands; s private.poker_seats; o record; v_target bigint; v_pay bigint;
+begin
+  select * into h from private.poker_hands where table_id = p_table;
+  select * into s from private.poker_seats where table_id = p_table and seat = p_seat;
+  select * into o from private.poker_options(p_table, p_seat);
+  if p_action = 'fold' then
+    update private.poker_seats set folded = true, acted = true, last_action = 'fold' where table_id = p_table and seat = p_seat;
+  elsif p_action = 'check' then
+    if o.to_call > 0 then return 'You can''t check: there is a bet to call.'; end if;
+    update private.poker_seats set acted = true, acted_level = h.current_bet, last_action = 'check' where table_id = p_table and seat = p_seat;
+  elsif p_action = 'call' then
+    if o.to_call <= 0 then return 'There is nothing to call.'; end if;
+    update private.poker_seats set stack = stack - o.to_call, bet = bet + o.to_call, committed = committed + o.to_call, all_in = (stack = o.to_call),
+      acted = true, acted_level = h.current_bet, last_action = case when stack = o.to_call then 'allin' else 'call' end
+    where table_id = p_table and seat = p_seat;
+  elsif p_action in ('bet', 'raise') then
+    if p_action = 'bet' and h.current_bet > 0 then return 'There is already a bet. Call, raise or fold.'; end if;
+    if p_action = 'raise' and h.current_bet = 0 then return 'Nobody has bet yet. Check or bet.'; end if;
+    if not o.can_raise then return 'You can only call or fold here.'; end if;
+    if p_amount is null or p_amount <> trunc(p_amount) or not (p_amount > 0 and p_amount < 1e15) then return 'Enter a whole number of chips.'; end if;
+    v_target := p_amount::bigint;
+    if v_target > o.max_to then return 'You don''t have that many chips.'; end if;
+    if v_target < o.min_to then return format('The smallest %s here is %s.', p_action, o.min_to); end if;
+    v_pay := v_target - s.bet;
+    update private.poker_seats set stack = stack - v_pay, bet = v_target, committed = committed + v_pay, all_in = (stack = v_pay),
+      acted = true, acted_level = v_target, last_action = case when stack = v_pay then 'allin' else p_action end
+    where table_id = p_table and seat = p_seat;
+    if v_target - h.current_bet >= h.last_raise then
+      -- A full bet or raise: everyone else gets to act again.
+      update private.poker_hands set last_raise = v_target - h.current_bet, current_bet = v_target, aggressor = p_seat where table_id = p_table;
+      update private.poker_seats set acted = false where table_id = p_table and in_hand and not folded and not all_in and seat <> p_seat;
+    else
+      -- An all-in for less than a full raise: the bet goes up but the betting is not reopened.
+      update private.poker_hands set current_bet = v_target, aggressor = p_seat where table_id = p_table;
+    end if;
+  else
+    return 'Unknown move.';
+  end if;
+  return null;
+end $$;
+
+/** Returns the part of the highest bet on this round that nobody matched. */
+create or replace function private.poker_refund(p_table bigint) returns void
+language plpgsql volatile set search_path = '' as $$
+declare v_seat int; v_top bigint; v_second bigint;
+begin
+  select seat, bet into v_seat, v_top from private.poker_seats where table_id = p_table and in_hand order by bet desc, seat limit 1;
+  select coalesce(max(bet), 0) into v_second from private.poker_seats where table_id = p_table and in_hand and seat <> v_seat;
+  if v_top > v_second then
+    update private.poker_seats set bet = v_second, committed = committed - (v_top - v_second), stack = stack + (v_top - v_second), all_in = false
+    where table_id = p_table and seat = v_seat;
+  end if;
+end $$;
+
+/** Moves a seat's stack back to cash. Chips bought in an earlier run (before a balance reset) are dropped. */
+create or replace function private.poker_cashout(p_table bigint, p_seat int) returns void
+language plpgsql volatile set search_path = '' as $$
+declare s private.poker_seats;
+begin
+  select * into s from private.poker_seats where table_id = p_table and seat = p_seat;
+  if s.stack > 0 and s.user_id is not null then
+    update public.portfolios set cash = cash + s.stack, updated_at = now() where user_id = s.user_id and run = s.run;
+  end if;
+  update private.poker_seats set stack = 0 where table_id = p_table and seat = p_seat;
+end $$;
+
+/** Between hands: frees the seats of players who left, were deleted, stayed out too long, or whose browser has gone quiet. */
+create or replace function private.poker_cleanup(p_table bigint, p_base timestamptz) returns void
+language plpgsql volatile set search_path = '' as $$
+declare s private.poker_seats;
+begin
+  for s in select * from private.poker_seats where table_id = p_table and (user_id is null or leaving
+      or (sitting_out and away_since + make_interval(secs => private.poker_k('away')) <= p_base)
+      or seen_at + make_interval(secs => private.poker_k('away')) <= p_base) loop
+    perform private.poker_cashout(p_table, s.seat);
+    delete from private.poker_seats where table_id = p_table and seat = s.seat;
+  end loop;
+end $$;
+
+/** Ends the hand: awards every pot, records each player's result and starts the pause before the next deal. */
+create or replace function private.poker_finish(p_table bigint, p_base timestamptz) returns void
+language plpgsql volatile set search_path = '' as $$
+declare t public.poker_tables; h private.poker_hands; s private.poker_seats; v_live int; v_total bigint; v_prev bigint := 0; v_lvl bigint; v_max bigint;
+  v_amt bigint; v_best int[]; v_winners int[]; v_n int; v_share bigint; v_rem bigint; i int; v_pots jsonb := '[]'; v_first int; v_shown_best int[];
+  v_showdown boolean; v_detail text; v_feed text;
+begin
+  select * into t from public.poker_tables where id = p_table;
+  perform private.poker_refund(p_table);
+  select * into h from private.poker_hands where table_id = p_table;
+  select count(*) filter (where not folded), coalesce(sum(committed), 0) into v_live, v_total from private.poker_seats where table_id = p_table and in_hand;
+  v_showdown := v_live > 1;
+  if not v_showdown then
+    -- Everyone else folded: the pot goes to the last player, cards unseen.
+    update private.poker_seats set won = v_total where table_id = p_table and in_hand and not folded returning seat into i;
+    v_pots := jsonb_build_array(jsonb_build_object('amount', v_total, 'seats', jsonb_build_array(i),
+      'winners', jsonb_build_array(jsonb_build_object('seat', i, 'amount', v_total))));
+  else
+    update private.poker_seats set hand_rank = private.poker_rank(hole || h.board) where table_id = p_table and in_hand and not folded;
+    select max(committed) into v_max from private.poker_seats where table_id = p_table and in_hand and not folded;
+    -- One pot per all-in level, smallest first. The last also takes anything a folded player put in above it.
+    for v_lvl in select distinct committed from private.poker_seats where table_id = p_table and in_hand and not folded order by committed loop
+      select coalesce(sum(least(committed, v_lvl) - least(committed, v_prev)), 0)
+          + case when v_lvl = v_max then coalesce(sum(greatest(committed - v_lvl, 0)), 0) else 0 end
+        into v_amt from private.poker_seats where table_id = p_table and in_hand;
+      v_prev := v_lvl;
+      continue when v_amt <= 0;
+      select max(hand_rank) into v_best from private.poker_seats where table_id = p_table and in_hand and not folded and committed >= v_lvl;
+      -- Winners in order from the button's left, which is also who gets an odd chip first.
+      select array_agg(seat order by (seat - h.button + 5) % 6) into v_winners from private.poker_seats
+        where table_id = p_table and in_hand and not folded and committed >= v_lvl and hand_rank = v_best;
+      v_n := array_length(v_winners, 1);
+      v_share := v_amt / v_n;
+      v_rem := v_amt % v_n;
+      for i in 1..v_n loop
+        update private.poker_seats set won = won + v_share + case when i <= v_rem then 1 else 0 end where table_id = p_table and seat = v_winners[i];
+      end loop;
+      v_pots := v_pots || jsonb_build_object('amount', v_amt,
+        'seats', (select jsonb_agg(seat order by seat) from private.poker_seats where table_id = p_table and in_hand and not folded and committed >= v_lvl),
+        'winners', (select jsonb_agg(jsonb_build_object('seat', v_winners[x], 'amount', v_share + case when x <= v_rem then 1 else 0 end) order by x)
+          from generate_series(1, v_n) x));
+    end loop;
+    -- Who shows: from the last river bettor (or the button's left), a hand that wins or is the best so far is shown, the rest are mucked.
+    select seat into v_first from private.poker_seats where table_id = p_table and in_hand and not folded
+      order by (seat = h.aggressor) desc nulls last, (seat - h.button + 5) % 6 limit 1;
+    for s in select * from private.poker_seats where table_id = p_table and in_hand and not folded order by (seat - v_first + 6) % 6 loop
+      if h.runout > 0 or s.won > 0 or v_shown_best is null or s.hand_rank >= v_shown_best then
+        update private.poker_seats set shown = true where table_id = p_table and seat = s.seat;
+        if v_shown_best is null or s.hand_rank > v_shown_best then v_shown_best := s.hand_rank; end if;
+      end if;
+    end loop;
+  end if;
+
+  -- Each player's result for the hand goes to their history and the leaderboard totals; wins also go to the feed.
+  -- (A player can win without having put a chip in, when the blinds both leave before the first move.)
+  for s in select * from private.poker_seats where table_id = p_table and in_hand and (committed > 0 or won > 0) and user_id is not null and run >= 0 loop
+    v_detail := case
+      when s.won > 0 and v_showdown then 'Won with ' || private.poker_rank_name(s.hand_rank)
+      when s.won > 0 then 'Won, everyone else folded'
+      when s.folded then 'Folded'
+      else 'Lost with ' || private.poker_rank_name(s.hand_rank) end;
+    perform private.game_record(s.user_id, s.run, 'poker', s.committed, s.won, format('%s · $%s/$%s', v_detail, t.small_blind, t.big_blind));
+    if s.won > s.committed then
+      v_feed := case when v_showdown then 'with ' || private.poker_rank_name(s.hand_rank) else 'when everyone else folded' end;
+      perform private.game_activity(s.user_id, 'poker', s.committed, s.won - s.committed, format('%s ($%s/$%s)', v_feed, t.small_blind, t.big_blind));
+    end if;
+  end loop;
+
+  update private.poker_hands set street = 'done', to_act = null, result = jsonb_build_object('showdown', v_showdown, 'pots', v_pots,
+    'players', (select jsonb_agg(jsonb_build_object('seat', seat, 'won', won, 'net', won - committed) order by seat)
+      from private.poker_seats where table_id = p_table and in_hand))
+  where table_id = p_table;
+
+  -- The fairness record: the seals for the whole deck, and the salts of the cards that were shown.
+  insert into private.poker_proofs (table_id, hand_no, deck_hash, commits, reveals, holes) values (p_table, h.hand_no, h.deck_hash, h.commits,
+    coalesce((select jsonb_agg(jsonb_build_object('i', x, 'card', h.deck[x], 'salt', h.salts[x]) order by x) from (
+      select unnest(h.board_idx) as x
+      union select unnest(hole_idx) from private.poker_seats where table_id = p_table and in_hand and shown) q), '[]'),
+    coalesce((select jsonb_object_agg(user_id::text, (select jsonb_agg(jsonb_build_object('i', x, 'card', h.deck[x], 'salt', h.salts[x]) order by x) from unnest(hole_idx) x))
+      from private.poker_seats where table_id = p_table and in_hand and user_id is not null), '{}'))
+  on conflict (table_id) do update set hand_no = excluded.hand_no, deck_hash = excluded.deck_hash, commits = excluded.commits,
+    reveals = excluded.reveals, holes = excluded.holes;
+
+  update private.poker_seats set stack = stack + won, bet = 0, committed = 0 where table_id = p_table and in_hand;
+  -- Out of chips: sat out until they add more (or the seat is freed).
+  update private.poker_seats set sitting_out = true, away_since = coalesce(away_since, p_base)
+  where table_id = p_table and stack = 0 and not leaving and user_id is not null;
+  update public.poker_tables set deadline = p_base + make_interval(secs => private.poker_k('pause') + case when h.runout > 0 then private.poker_k('runout') else 0 end)
+  where id = p_table;
+end $$;
+
+/**
+ * After a move or a deal: gives the turn to the next player who has something
+ * to decide, or closes the betting round (dealing the next cards), or ends the
+ * hand. Players who are gone or sat out are checked or folded on the spot.
+ */
+create or replace function private.poker_progress(p_table bigint, p_from int, p_base timestamptz) returns void
+language plpgsql volatile set search_path = '' as $$
+declare t public.poker_tables; h private.poker_hands; s private.poker_seats; v_live int; v_active int; v_owing int; v_from int := p_from; v_n int;
+  v_runout boolean; guard int := 0;
+begin
+  select * into t from public.poker_tables where id = p_table;
+  loop
+    guard := guard + 1;
+    if guard > 80 then raise exception 'The hand did not settle.'; end if;
+    select * into h from private.poker_hands where table_id = p_table;
+    select count(*) filter (where not folded), count(*) filter (where not folded and not all_in)
+      into v_live, v_active from private.poker_seats where table_id = p_table and in_hand;
+    if v_live <= 1 then
+      perform private.poker_finish(p_table, p_base);
+      return;
+    end if;
+    -- Whether the one player who can still bet has an all-in bet above their own to answer.
+    select count(*) into v_owing from private.poker_seats a where a.table_id = p_table and a.in_hand and not a.folded and not a.all_in
+      and a.bet < (select coalesce(max(b.bet), 0) from private.poker_seats b where b.table_id = p_table and b.in_hand and not b.folded and b.seat <> a.seat);
+    s := null;
+    -- With one player left who can bet and nothing for them to call, there is no betting to do.
+    if v_active > 1 or v_owing > 0 then
+      select * into s from private.poker_seats where table_id = p_table and in_hand and not folded and not all_in
+        and (not acted or bet < h.current_bet) order by (seat - v_from + 5) % 6 limit 1;
+    end if;
+    if s.seat is not null then
+      if s.user_id is null or s.leaving or s.timeouts >= private.poker_k('timeouts') then
+        perform private.poker_apply(p_table, s.seat, case when s.bet >= h.current_bet then 'check' else 'fold' end, null);
+        v_from := s.seat;
+        continue;
+      end if;
+      update private.poker_hands set to_act = s.seat, turn = turn + 1 where table_id = p_table;
+      update public.poker_tables set deadline = p_base + make_interval(secs => private.poker_k('turn')) where id = p_table;
+      return;
+    end if;
+
+    -- The betting round is over.
+    perform private.poker_refund(p_table);
+    if h.street = 'river' then
+      perform private.poker_finish(p_table, p_base);
+      return;
+    end if;
+    select count(*) filter (where not folded and not all_in) <= 1 into v_runout from private.poker_seats where table_id = p_table and in_hand;
+    -- Burn one, then deal three for the flop or one for the turn and river.
+    v_n := case when h.street = 'preflop' then 3 else 1 end;
+    update private.poker_hands set
+      street = case h.street when 'preflop' then 'flop' when 'flop' then 'turn' else 'river' end,
+      board = board || deck[next_card + 2 : next_card + 1 + v_n],
+      board_idx = board_idx || (select array_agg(x) from generate_series(h.next_card + 2, h.next_card + 1 + v_n) x),
+      next_card = next_card + 1 + v_n,
+      current_bet = 0, last_raise = t.big_blind, aggressor = null, to_act = null,
+      runout = runout + case when v_runout then v_n else 0 end
+    where table_id = p_table;
+    update private.poker_seats set bet = 0, acted = false, acted_level = 0, last_action = case when folded or all_in then last_action end
+    where table_id = p_table and in_hand;
+    v_from := h.button;
+  end loop;
+end $$;
+
+/** Deals a new hand if at least two players are ready. Returns false (and deals nothing) otherwise. */
+create or replace function private.poker_start(p_table bigint, p_base timestamptz) returns boolean
+language plpgsql volatile set search_path = '' as $$
+declare t public.poker_tables; h private.poker_hands; n int; v_button int; v_sb int; v_bb int; v_deck text[]; v_salts text[] := '{}';
+  v_commits text[] := '{}'; i int; k int := 0; r record;
+begin
+  select * into t from public.poker_tables where id = p_table;
+  select * into h from private.poker_hands where table_id = p_table;
+  update private.poker_seats set in_hand = user_id is not null and not sitting_out and not leaving and stack > 0,
+    folded = false, all_in = false, bet = 0, committed = 0, acted = false, acted_level = 0,
+    hole = null, hole_idx = null, hand_rank = null, shown = false, won = 0, last_action = null
+  where table_id = p_table;
+  select count(*) into n from private.poker_seats where table_id = p_table and in_hand;
+  if n < 2 then
+    update private.poker_seats set in_hand = false where table_id = p_table and in_hand;
+    return false;
+  end if;
+  if h.table_id is null then
+    select seat into v_button from private.poker_seats where table_id = p_table and in_hand order by seat offset private.rand_int(n) limit 1;
+  else
+    select seat into v_button from private.poker_seats where table_id = p_table and in_hand order by (seat - h.button + 5) % 6 limit 1;
+  end if;
+  if n = 2 then
+    v_sb := v_button;
+  else
+    select seat into v_sb from private.poker_seats where table_id = p_table and in_hand order by (seat - v_button + 5) % 6 limit 1;
+  end if;
+  select seat into v_bb from private.poker_seats where table_id = p_table and in_hand order by (seat - v_sb + 5) % 6 limit 1;
+
+  v_deck := private.poker_shuffle();
+  for i in 1..52 loop
+    v_salts := v_salts || encode(extensions.gen_random_bytes(16), 'hex');
+    v_commits := v_commits || encode(extensions.digest(v_salts[i] || ':' || v_deck[i], 'sha256'), 'hex');
+  end loop;
+  -- One card each from the button's left, twice round.
+  for r in select seat from private.poker_seats where table_id = p_table and in_hand order by (seat - v_button + 5) % 6 loop
+    update private.poker_seats set hole = array[v_deck[k + 1], v_deck[n + k + 1]], hole_idx = array[k + 1, n + k + 1]
+    where table_id = p_table and seat = r.seat;
+    k := k + 1;
+  end loop;
+  update private.poker_seats set bet = least(stack, t.small_blind), committed = least(stack, t.small_blind), all_in = stack <= t.small_blind,
+    stack = stack - least(stack, t.small_blind), last_action = 'sb' where table_id = p_table and seat = v_sb;
+  update private.poker_seats set bet = least(stack, t.big_blind), committed = least(stack, t.big_blind), all_in = stack <= t.big_blind,
+    stack = stack - least(stack, t.big_blind), last_action = 'bb' where table_id = p_table and seat = v_bb;
+
+  delete from private.poker_hands where table_id = p_table;
+  insert into private.poker_hands (table_id, hand_no, street, deck, salts, commits, deck_hash, next_card, button, sb_seat, bb_seat,
+    current_bet, last_raise, turn, started_at)
+  values (p_table, t.hand_no + 1, 'preflop', v_deck, v_salts, v_commits, encode(extensions.digest(array_to_string(v_commits, ','), 'sha256'), 'hex'),
+    2 * n, v_button, v_sb, v_bb, t.big_blind, t.big_blind, coalesce(h.turn, 0), p_base);
+  update public.poker_tables set hand_no = hand_no + 1 where id = p_table;
+  perform private.poker_progress(p_table, v_bb, p_base);
+  return true;
+end $$;
+
+/**
+ * When a table with no hand to deal should next be looked at: as soon as a
+ * player who is sitting out has been gone long enough to lose the seat, and
+ * otherwise every few minutes while anyone is seated, to free the seats of
+ * players whose browsers have gone. Null for an empty table.
+ */
+create or replace function private.poker_idle_check(p_table bigint, p_base timestamptz) returns timestamptz
+language sql stable set search_path = '' as $$
+  select case when count(*) > 0 then least(
+    min(away_since + make_interval(secs => private.poker_k('away'))) filter (where sitting_out),
+    p_base + make_interval(secs => private.poker_k('away'))) end
+  from private.poker_seats where table_id = p_table
+$$;
+
+/** No hand to deal: clears the felt and sets the next look at the table, if anyone is seated. */
+create or replace function private.poker_idle(p_table bigint, p_base timestamptz) returns void
+language plpgsql volatile set search_path = '' as $$
+begin
+  update private.poker_hands set street = 'idle', to_act = null, result = null where table_id = p_table;
+  update public.poker_tables set deadline = private.poker_idle_check(p_table, p_base) where id = p_table;
+end $$;
+
+/** Notes that a seated player's browser is still there (written at most every 30 seconds). */
+create or replace function private.poker_seen(p_table bigint, p_user uuid) returns void
+language sql volatile set search_path = '' as $$
+  update private.poker_seats set seen_at = now() where table_id = p_table and user_id = p_user and seen_at < now() - interval '30 seconds'
+$$;
+
+/** A player sat down, came back or added chips: starts the countdown to a deal once two are ready. */
+create or replace function private.poker_wake(p_table bigint) returns void
+language plpgsql volatile set search_path = '' as $$
+declare h private.poker_hands; v_ready int;
+begin
+  select * into h from private.poker_hands where table_id = p_table;
+  -- A hand in play or just finished already has its own deadline.
+  if h.table_id is not null and h.street <> 'idle' then return; end if;
+  select count(*) into v_ready from private.poker_seats where table_id = p_table and user_id is not null and not sitting_out and not leaving and stack > 0;
+  if v_ready >= 2 then
+    update public.poker_tables set deadline = now() + make_interval(secs => private.poker_k('start'))
+    where id = p_table and (deadline is null or deadline > now() + make_interval(secs => private.poker_k('start')));
+  else
+    update public.poker_tables set deadline = private.poker_idle_check(p_table, now()) where id = p_table;
+  end if;
+end $$;
+
+/** Chips collected on earlier betting rounds, split into the main pot and side pots (amounts only). */
+create or replace function private.poker_pots(p_table bigint) returns jsonb
+language plpgsql stable set search_path = '' as $$
+declare v_lvl bigint; v_prev bigint := 0; v_max bigint; v_amt bigint; v_out jsonb := '[]';
+begin
+  select max(committed - bet) into v_max from private.poker_seats where table_id = p_table and in_hand and not folded;
+  for v_lvl in select distinct committed - bet from private.poker_seats where table_id = p_table and in_hand and not folded and committed > bet order by 1 loop
+    select coalesce(sum(least(committed - bet, v_lvl) - least(committed - bet, v_prev)), 0)
+        + case when v_lvl = v_max then coalesce(sum(greatest(committed - bet - v_lvl, 0)), 0) else 0 end
+      into v_amt from private.poker_seats where table_id = p_table and in_hand;
+    v_prev := v_lvl;
+    if v_amt > 0 then v_out := v_out || to_jsonb(v_amt); end if;
+  end loop;
+  return v_out;
+end $$;
+
+/**
+ * Rebuilds the public state of a table from an explicit list of fields and
+ * bumps its version. A player's cards are included only when the hand is
+ * over and they were shown; the deck, burn cards and mucked hands never are.
+ */
+create or replace function private.poker_publish(p_table bigint) returns void
+language plpgsql volatile set search_path = '' as $$
+declare t public.poker_tables; h private.poker_hands; o record; v_phase text; v_live boolean; v_seats jsonb; v_act jsonb;
+begin
+  select * into t from public.poker_tables where id = p_table;
+  select * into h from private.poker_hands where table_id = p_table;
+  v_phase := case when h.table_id is null or h.street = 'idle' then 'waiting' when h.street = 'done' then 'showdown' else h.street end;
+  v_live := v_phase not in ('waiting', 'showdown');
+  select jsonb_agg(case when s.seat is null then null else jsonb_build_object(
+      'name', s.username, 'stack', s.stack, 'bet', s.bet, 'inHand', s.in_hand and v_phase <> 'waiting', 'folded', s.folded, 'allIn', s.all_in,
+      'away', s.sitting_out, 'left', s.leaving or s.user_id is null, 'last', s.last_action,
+      'cards', case when v_phase = 'showdown' and s.shown then to_jsonb(s.hole) end,
+      'rank', case when v_phase = 'showdown' and s.shown then to_jsonb(s.hand_rank) end,
+      'won', case when v_phase = 'showdown' then s.won else 0 end) end order by g.n)
+    into v_seats from generate_series(0, t.max_seats - 1) g(n) left join private.poker_seats s on s.table_id = p_table and s.seat = g.n;
+  if v_live and h.to_act is not null then
+    select * into o from private.poker_options(p_table, h.to_act);
+    v_act := jsonb_build_object('seat', h.to_act, 'toCall', o.to_call, 'canRaise', o.can_raise, 'minRaise', o.min_to, 'maxRaise', o.max_to);
+  end if;
+  update public.poker_tables set version = version + 1, updated_at = now(),
+    seated = (select count(*) from private.poker_seats where table_id = p_table and user_id is not null and not leaving),
+    state = jsonb_build_object(
+      'phase', v_phase,
+      'hand', t.hand_no,
+      'button', case when v_phase <> 'waiting' then h.button end,
+      'sb', case when v_phase <> 'waiting' then h.sb_seat end,
+      'bb', case when v_phase <> 'waiting' then h.bb_seat end,
+      'board', case when v_phase <> 'waiting' then to_jsonb(h.board) else '[]'::jsonb end,
+      'pot', case when v_live then (select coalesce(sum(committed), 0) from private.poker_seats where table_id = p_table and in_hand) else 0 end,
+      'pots', case when v_live then private.poker_pots(p_table) else '[]'::jsonb end,
+      'bet', case when v_live then h.current_bet else 0 end,
+      'act', v_act,
+      'turn', coalesce(h.turn, 0),
+      'runout', case when v_phase = 'showdown' then h.runout else 0 end,
+      'deadline', private.ms(t.deadline),
+      'deckHash', case when v_phase <> 'waiting' then h.deck_hash end,
+      'result', case when v_phase = 'showdown' then h.result end,
+      'seats', v_seats)
+  where id = p_table;
+end $$;
+
+/**
+ * Plays out everything whose time has come: turns that ran out (check if
+ * free, else fold; two in a row sit the player out), the deal after a
+ * finished hand, and idle seats to free. Returns true when anything changed.
+ */
+create or replace function private.poker_advance(p_table bigint) returns boolean
+language plpgsql volatile set search_path = '' as $$
+declare t public.poker_tables; h private.poker_hands; s private.poker_seats; v_due timestamptz; v_changed boolean := false; guard int := 0;
+begin
+  loop
+    select * into t from public.poker_tables where id = p_table;
+    exit when t.deadline is null or t.deadline + make_interval(secs => private.poker_k('grace')) > now();
+    -- A table left for a very long time catches up over a few calls rather than in one.
+    guard := guard + 1;
+    exit when guard > 400;
+    v_due := t.deadline;
+    v_changed := true;
+    select * into h from private.poker_hands where table_id = p_table;
+    if h.table_id is not null and h.street not in ('done', 'idle') then
+      if h.to_act is null then
+        perform private.poker_progress(p_table, h.button, v_due);
+        continue;
+      end if;
+      select * into s from private.poker_seats where table_id = p_table and seat = h.to_act;
+      perform private.poker_apply(p_table, h.to_act, case when s.bet >= h.current_bet then 'check' else 'fold' end, null);
+      update private.poker_seats set timeouts = timeouts + 1,
+        sitting_out = sitting_out or timeouts + 1 >= private.poker_k('timeouts'),
+        away_since = case when timeouts + 1 >= private.poker_k('timeouts') then coalesce(away_since, v_due) else away_since end
+      where table_id = p_table and seat = h.to_act;
+      perform private.poker_progress(p_table, h.to_act, v_due);
+    else
+      perform private.poker_cleanup(p_table, v_due);
+      if not private.poker_start(p_table, v_due) then perform private.poker_idle(p_table, v_due); end if;
+    end if;
+  end loop;
+  if v_changed then perform private.poker_publish(p_table); end if;
+  return v_changed;
+end $$;
+
+/**
+ * Takes a player off the table. Mid-hand they fold first (an all-in player
+ * stays in for the pots they can win); the seat itself is freed when the hand
+ * is over. With p_refund the stack goes back to cash, otherwise it is dropped
+ * (a balance reset or a deleted account).
+ */
+create or replace function private.poker_remove(p_table bigint, p_seat int, p_refund boolean) returns void
+language plpgsql volatile set search_path = '' as $$
+declare h private.poker_hands; s private.poker_seats; v_active boolean;
+begin
+  select * into h from private.poker_hands where table_id = p_table;
+  select * into s from private.poker_seats where table_id = p_table and seat = p_seat;
+  if s.seat is null then return; end if;
+  v_active := h.table_id is not null and h.street not in ('done', 'idle');
+  if not p_refund then
+    update private.poker_seats set stack = 0, run = -1 where table_id = p_table and seat = p_seat;
+  end if;
+  if h.table_id is null or h.street = 'idle' or not s.in_hand then
+    perform private.poker_cashout(p_table, p_seat);
+    delete from private.poker_seats where table_id = p_table and seat = p_seat;
+    return;
+  end if;
+  update private.poker_seats set leaving = true where table_id = p_table and seat = p_seat;
+  if v_active and not s.folded and not s.all_in then
+    perform private.poker_apply(p_table, p_seat, 'fold', null);
+    if h.to_act = p_seat then
+      perform private.poker_progress(p_table, p_seat, now());
+    elsif (select count(*) from private.poker_seats where table_id = p_table and in_hand and not folded) <= 1 then
+      -- Folding out of turn left one player standing.
+      perform private.poker_finish(p_table, now());
+    end if;
+  end if;
+  -- Chips no longer at risk go back now. An all-in player's winnings follow when the seat is freed.
+  select * into h from private.poker_hands where table_id = p_table;
+  if h.street = 'done' or (select folded from private.poker_seats where table_id = p_table and seat = p_seat) then
+    perform private.poker_cashout(p_table, p_seat);
+  end if;
+end $$;
+
+/** Takes a player off whatever table they are at, dropping their chips (see reset_balance and delete_account). */
+create or replace function private.poker_evict(p_user uuid) returns void
+language plpgsql volatile set search_path = '' as $$
+declare v_table bigint; s private.poker_seats;
+begin
+  select table_id into v_table from private.poker_seats where user_id = p_user;
+  if v_table is null then return; end if;
+  perform 1 from public.poker_tables where id = v_table for update;
+  select * into s from private.poker_seats where table_id = v_table and user_id = p_user;
+  if s.seat is null then return; end if;
+  perform private.poker_remove(v_table, s.seat, false);
+  perform private.poker_wake(v_table);
+  perform private.poker_publish(v_table);
+end $$;
+
+/** Keeps a table with a free seat open at every stake, adding one when they are all full. */
+create or replace function private.poker_ensure_tables() returns void
+language plpgsql volatile set search_path = '' as $$
+declare st record; v_id bigint;
+begin
+  -- One caller at a time, so a burst of visitors can't open a row of empty tables.
+  if not pg_try_advisory_xact_lock(hashtext('poker-tables')) then return; end if;
+  for st in select * from private.poker_stakes() loop
+    if not exists (select 1 from public.poker_tables where stake = st.stake and seated < max_seats) then
+      insert into public.poker_tables (stake, small_blind, big_blind, min_buy, max_buy)
+      values (st.stake, st.small_blind, st.big_blind, st.min_buy, st.max_buy) returning id into v_id;
+      perform private.poker_publish(v_id);
+    end if;
+  end loop;
+end $$;
+
+/**
+ * The backstop for tables nobody is watching: plays out overdue turns, and
+ * closes spare empty tables (one with a free seat always stays open per
+ * stake). Cheap when there is nothing to do: one indexed lookup.
+ */
+create or replace function private.poker_sweep() returns int
+language plpgsql volatile set search_path = '' as $$
+declare r record; n int := 0;
+begin
+  for r in select id from public.poker_tables where deadline is not null and deadline < now() - interval '3 seconds'
+      order by deadline limit 50 for update skip locked loop
+    if private.poker_advance(r.id) then n := n + 1; end if;
+  end loop;
+  delete from public.poker_tables where id in (
+    select t.id from public.poker_tables t
+    where t.seated = 0 and t.updated_at < now() - interval '10 minutes'
+      and not exists (select 1 from private.poker_seats s where s.table_id = t.id)
+      and (t.stake not in (select stake from private.poker_stakes())
+        or exists (select 1 from public.poker_tables o where o.stake = t.stake and o.id < t.id and o.seated < o.max_seats))
+    for update of t skip locked);
+  perform private.poker_ensure_tables();
+  return n;
+end $$;
+
+/** A table as one player sees it: the public state plus their own seat and cards. */
+create or replace function private.poker_view(p_table bigint, p_user uuid) returns jsonb
+language sql volatile set search_path = '' as $$
+  select jsonb_build_object(
+    'table', jsonb_build_object('id', t.id, 'stake', t.stake, 'smallBlind', t.small_blind, 'bigBlind', t.big_blind,
+      'minBuy', t.min_buy, 'maxBuy', t.max_buy, 'seats', t.max_seats, 'version', t.version, 'state', t.state),
+    'me', (select jsonb_build_object('seat', s.seat, 'stack', s.stack, 'cards', case when s.in_hand then to_jsonb(s.hole) end,
+        'away', s.sitting_out, 'left', s.leaving)
+      from private.poker_seats s where s.table_id = p_table and s.user_id = p_user),
+    'now', private.now_ms())
+  from public.poker_tables t where t.id = p_table
+$$;
+
+-- What the browser calls. Refusals come back as { "error": "..." } rather than
+-- being raised, so the turns played out on the way in (and the rate limit) are kept.
+
+/** The lobby: every open table with its stakes and seats filled, and where the caller is seated. */
+create or replace function public.poker_lobby() returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid();
+begin
+  perform private.rate_limit(v_user, 'poker-lobby', 40);
+  perform private.poker_sweep();
+  return jsonb_build_object(
+    'tables', coalesce((select jsonb_agg(jsonb_build_object('id', t.id, 'stake', t.stake, 'smallBlind', t.small_blind, 'bigBlind', t.big_blind,
+        'minBuy', t.min_buy, 'maxBuy', t.max_buy, 'seats', t.max_seats, 'seated', t.seated,
+        'players', (select coalesce(jsonb_agg(x -> 'name'), '[]') from jsonb_array_elements(t.state -> 'seats') x where x <> 'null' and not (x ->> 'left')::boolean))
+      order by t.big_blind, t.id) from public.poker_tables t), '[]'),
+    'seat', (select jsonb_build_object('table', s.table_id, 'stack', s.stack) from private.poker_seats s where s.user_id = v_user and not s.leaving),
+    'canSit', not private.is_guest(v_user));
+end $$;
+
+/** The caller's view of a table. Also plays out any turn whose time is up. */
+create or replace function public.poker_state(p_table bigint) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid(); t public.poker_tables;
+begin
+  perform private.rate_limit(v_user, 'poker-state', 150);
+  select * into t from public.poker_tables where id = p_table;
+  if t.id is null then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  if t.deadline is not null and t.deadline + make_interval(secs => private.poker_k('grace')) <= now() then
+    perform 1 from public.poker_tables where id = p_table for update;
+    perform private.poker_advance(p_table);
+  end if;
+  perform private.poker_seen(p_table, v_user);
+  return private.poker_view(p_table, v_user);
+end $$;
+
+/**
+ * The clock push. Browsers call it when a deadline they can see has passed;
+ * it plays out the turn (or deals the next hand) and returns the new version.
+ * The new state itself reaches everyone over Realtime.
+ */
+create or replace function public.poker_tick(p_table bigint) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid(); t public.poker_tables;
+begin
+  perform private.rate_limit(v_user, 'poker-tick', 60);
+  select * into t from public.poker_tables where id = p_table;
+  if t.id is null then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  if t.deadline is not null and t.deadline + make_interval(secs => private.poker_k('grace')) <= now() then
+    perform 1 from public.poker_tables where id = p_table for update;
+    perform private.poker_advance(p_table);
+  end if;
+  perform private.poker_seen(p_table, v_user);
+  return (select jsonb_build_object('version', version) from public.poker_tables where id = p_table);
+end $$;
+
+/** Takes a seat with a buy-in from cash. p_seat picks a seat (0 to 5); null takes the first free one. */
+create or replace function public.poker_sit(p_table bigint, p_buy_in numeric, p_seat int default null) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid(); t public.poker_tables; pf public.portfolios; v_seat int; v_amt bigint; v_err text;
+begin
+  perform private.rate_limit(v_user, 'poker-seat', 30);
+  select * into t from public.poker_tables where id = p_table for update;
+  if t.id is null then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  perform private.poker_advance(p_table);
+  select * into pf from public.portfolios where user_id = v_user for update;
+  if private.is_guest(v_user) then v_err := 'Sign up to take a seat. Guests can watch.';
+  elsif exists (select 1 from private.poker_seats where user_id = v_user and leaving) then v_err := 'Your last hand is still finishing. Try again in a moment.';
+  elsif exists (select 1 from private.poker_seats where user_id = v_user) then v_err := 'You already have a seat. Leave that table first.';
+  elsif p_buy_in is null or p_buy_in <> trunc(p_buy_in) or not (p_buy_in >= t.min_buy and p_buy_in <= t.max_buy) then
+    v_err := format('Buy in for $%s to $%s, in whole dollars.', t.min_buy, t.max_buy);
+  elsif p_buy_in > pf.cash then v_err := 'Not enough cash for that buy-in.';
+  elsif p_seat is not null and (p_seat < 0 or p_seat >= t.max_seats) then v_err := 'Pick a seat at this table.';
+  elsif p_seat is not null and exists (select 1 from private.poker_seats where table_id = p_table and seat = p_seat) then v_err := 'That seat was just taken.';
+  end if;
+  if v_err is null then
+    v_seat := coalesce(p_seat, (select g from generate_series(0, t.max_seats - 1) g
+      where not exists (select 1 from private.poker_seats where table_id = p_table and seat = g) order by g limit 1));
+    if v_seat is null then v_err := 'This table is full.'; end if;
+  end if;
+  if v_err is not null then return private.poker_view(p_table, v_user) || jsonb_build_object('error', v_err); end if;
+  v_amt := p_buy_in::bigint;
+  update public.portfolios set cash = cash - v_amt, updated_at = now() where user_id = v_user;
+  insert into private.poker_seats (table_id, seat, user_id, username, run, stack) values (p_table, v_seat, v_user, private.username_of(v_user), pf.run, v_amt);
+  perform private.poker_wake(p_table);
+  perform private.poker_publish(p_table);
+  -- That may have filled the last open table at this stake.
+  perform private.poker_ensure_tables();
+  return private.poker_view(p_table, v_user) || jsonb_build_object('portfolio', private.portfolio_json(v_user));
+end $$;
+
+/** Leaves the table: folds any live hand and moves the stack back to cash. */
+create or replace function public.poker_leave(p_table bigint) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid(); s private.poker_seats;
+begin
+  perform private.rate_limit(v_user, 'poker-seat', 30);
+  perform 1 from public.poker_tables where id = p_table for update;
+  if not found then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  perform private.poker_advance(p_table);
+  select * into s from private.poker_seats where table_id = p_table and user_id = v_user and not leaving;
+  if s.seat is null then return private.poker_view(p_table, v_user) || jsonb_build_object('error', 'You are not seated at this table.'); end if;
+  perform private.poker_remove(p_table, s.seat, true);
+  perform private.poker_wake(p_table);
+  perform private.poker_publish(p_table);
+  return private.poker_view(p_table, v_user) || jsonb_build_object('portfolio', private.portfolio_json(v_user));
+end $$;
+
+/**
+ * A move: fold, check, call, bet or raise. p_amount is the total to have in on
+ * this betting round (for bet and raise). p_turn, when sent, is the turn the
+ * player was looking at: a late or repeated click for an earlier turn is
+ * ignored instead of being played as the next decision.
+ */
+create or replace function public.poker_act(p_table bigint, p_action text, p_amount numeric default null, p_turn int default null) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid(); h private.poker_hands; s private.poker_seats; v_err text;
+begin
+  perform private.rate_limit(v_user, 'poker-act', 90);
+  perform 1 from public.poker_tables where id = p_table for update;
+  if not found then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  perform private.poker_advance(p_table);
+  select * into h from private.poker_hands where table_id = p_table;
+  select * into s from private.poker_seats where table_id = p_table and user_id = v_user;
+  if s.seat is null then v_err := 'Take a seat first.';
+  elsif h.table_id is null or h.street in ('done', 'idle') or h.to_act is distinct from s.seat or s.leaving then v_err := 'It is not your turn.';
+  elsif p_turn is not null and p_turn <> h.turn then v_err := 'That move was for an earlier turn.';
+  else v_err := private.poker_apply(p_table, s.seat, coalesce(p_action, ''), p_amount);
+  end if;
+  if v_err is not null then return private.poker_view(p_table, v_user) || jsonb_build_object('error', v_err); end if;
+  update private.poker_seats set timeouts = 0, seen_at = now() where table_id = p_table and seat = s.seat;
+  perform private.poker_progress(p_table, s.seat, now());
+  perform private.poker_publish(p_table);
+  return private.poker_view(p_table, v_user);
+end $$;
+
+/** Sits out from the next hand (p_away true), or comes back. */
+create or replace function public.poker_away(p_table bigint, p_away boolean) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid(); s private.poker_seats;
+begin
+  perform private.rate_limit(v_user, 'poker-seat', 30);
+  perform 1 from public.poker_tables where id = p_table for update;
+  if not found then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  perform private.poker_advance(p_table);
+  select * into s from private.poker_seats where table_id = p_table and user_id = v_user and not leaving;
+  if s.seat is null then return private.poker_view(p_table, v_user) || jsonb_build_object('error', 'You are not seated at this table.'); end if;
+  if coalesce(p_away, false) then
+    update private.poker_seats set sitting_out = true, away_since = coalesce(away_since, now()), seen_at = now() where table_id = p_table and seat = s.seat;
+  elsif s.stack = 0 and not s.in_hand then
+    return private.poker_view(p_table, v_user) || jsonb_build_object('error', 'Add chips to play again.');
+  else
+    update private.poker_seats set sitting_out = false, away_since = null, timeouts = 0, seen_at = now() where table_id = p_table and seat = s.seat;
+  end if;
+  perform private.poker_wake(p_table);
+  perform private.poker_publish(p_table);
+  return private.poker_view(p_table, v_user);
+end $$;
+
+/** Adds chips from cash between hands, up to the table's largest buy-in. */
+create or replace function public.poker_buy(p_table bigint, p_amount numeric) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid(); t public.poker_tables; h private.poker_hands; s private.poker_seats; pf public.portfolios; v_err text;
+begin
+  perform private.rate_limit(v_user, 'poker-seat', 30);
+  select * into t from public.poker_tables where id = p_table for update;
+  if t.id is null then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  perform private.poker_advance(p_table);
+  select * into h from private.poker_hands where table_id = p_table;
+  select * into s from private.poker_seats where table_id = p_table and user_id = v_user and not leaving;
+  select * into pf from public.portfolios where user_id = v_user for update;
+  if s.seat is null then v_err := 'You are not seated at this table.';
+  elsif h.table_id is not null and h.street not in ('done', 'idle') and s.in_hand and not s.folded then v_err := 'You can add chips once this hand is over.';
+  elsif s.run <> pf.run then v_err := 'Leave the table and sit down again to buy in.';
+  elsif p_amount is null or p_amount <> trunc(p_amount) or not (p_amount >= 1 and p_amount < 1e15) then v_err := 'Enter a whole number of chips.';
+  elsif s.stack + p_amount > t.max_buy then v_err := format('You can have up to $%s in front of you when adding chips.', t.max_buy);
+  elsif s.stack + p_amount < t.min_buy then v_err := format('Bring your stack to at least $%s.', t.min_buy);
+  elsif p_amount > pf.cash then v_err := 'Not enough cash for that.';
+  end if;
+  if v_err is not null then return private.poker_view(p_table, v_user) || jsonb_build_object('error', v_err); end if;
+  update public.portfolios set cash = cash - p_amount, updated_at = now() where user_id = v_user;
+  update private.poker_seats set stack = stack + p_amount::bigint, sitting_out = false, away_since = null, timeouts = 0, seen_at = now()
+  where table_id = p_table and seat = s.seat;
+  perform private.poker_wake(p_table);
+  perform private.poker_publish(p_table);
+  return private.poker_view(p_table, v_user) || jsonb_build_object('portfolio', private.portfolio_json(v_user));
+end $$;
+
+/**
+ * The fairness record of the last finished hand at a table: the 52 seals whose
+ * hash was published before the deal, and the card and salt behind each seal
+ * that was shown (the board, hands shown at showdown, and the caller's own two
+ * cards). src/games/poker.js verifyProof() checks them in the browser.
+ */
+create or replace function public.poker_proof(p_table bigint) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid(); p private.poker_proofs;
+begin
+  perform private.rate_limit(v_user, 'poker-proof', 20);
+  select * into p from private.poker_proofs where table_id = p_table;
+  if p.table_id is null then return jsonb_build_object('error', 'No finished hand to check yet.'); end if;
+  return jsonb_build_object('hand', p.hand_no, 'deckHash', p.deck_hash, 'commits', to_jsonb(p.commits),
+    'reveals', (select coalesce(jsonb_agg(distinct x), '[]') from jsonb_array_elements(p.reveals || coalesce(p.holes -> v_user::text, '[]')) x));
+end $$;
+
+-- A table with a free seat at every stake, from the first run on.
+do $$ begin
+  perform private.poker_ensure_tables();
+end $$;
+
+-- ---------------------------------------------------------------------------
 -- A reliable 5-minute sync
 --
 -- The database starts the sync itself every 5 minutes with pg_cron and pg_net,
@@ -2531,6 +3657,18 @@ exception when others then
   raise notice 'Faster sync is off: %', sqlerrm;
 end $$;
 
+-- Tables: a once-a-minute backstop that plays out overdue turns at tables nobody is watching
+-- (players' own browsers keep the clock the rest of the time). It does one indexed lookup when idle.
+do $$ begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') then
+    perform cron.schedule('chami-tables', '* * * * *', 'select private.poker_sweep()');
+  else
+    raise notice 'Tables run without the pg_cron backstop: turn on the pg_cron extension, then run this file again.';
+  end if;
+exception when others then
+  raise notice 'Tables run without the pg_cron backstop: %', sqlerrm;
+end $$;
+
 -- ---------------------------------------------------------------------------
 -- Who may call what
 -- ---------------------------------------------------------------------------
@@ -2583,7 +3721,16 @@ grant execute on function
   public.chicken_start(numeric, text),
   public.chicken_step(),
   public.chicken_cashout(),
-  public.chicken_auto(numeric, text, int)
+  public.chicken_auto(numeric, text, int),
+  public.poker_lobby(),
+  public.poker_state(bigint),
+  public.poker_tick(bigint),
+  public.poker_sit(bigint, numeric, int),
+  public.poker_leave(bigint),
+  public.poker_act(bigint, text, numeric, int),
+  public.poker_away(bigint, boolean),
+  public.poker_buy(bigint, numeric),
+  public.poker_proof(bigint)
 to authenticated;
 
 do $$ begin

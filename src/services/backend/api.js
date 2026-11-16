@@ -205,10 +205,14 @@ export async function serverMarkets({ categories, ids = [] }) {
     .map((r) => ({ ...r.data, id: r.id, yesPrice: Number(r.yes_price), noPrice: Number(r.no_price), closed: r.closed }))
 }
 
-/** Results recorded on the server in the last `days` days, plus any for the given ids. */
-export async function serverResolutions({ days = 14, ids = [] } = {}) {
+/**
+ * Results recorded on the server in the last `days` days, plus any for the
+ * given ids. With `since` (a time in ms) only results from then on are read,
+ * which is how refreshes after the first avoid re-reading the whole list.
+ */
+export async function serverResolutions({ days = 14, ids = [], since: from = null } = {}) {
   const sb = await client()
-  const since = new Date(Date.now() - days * 864e5).toISOString()
+  const since = new Date(from ?? Date.now() - days * 864e5).toISOString()
   const [recent, held] = await Promise.all([
     sb.from('resolutions').select('market_id,outcome,source,title,resolved_at').gte('resolved_at', since).limit(2000),
     ids.length ? sb.from('resolutions').select('market_id,outcome,source,title,resolved_at').in('market_id', ids.slice(0, 200)) : { data: [] },
@@ -279,3 +283,30 @@ export const crashStart = ({ amount, auto }) => rpc('crash_start', { p_amount: a
 export const crashState = () => rpc('crash_state')
 export const crashCashout = () => rpc('crash_cashout')
 export const playSlots = ({ amount }) => rpc('play_slots', { p_amount: amount })
+
+// Tables (the card game between players) ----------------------------------------------
+// Every call answers with the caller's view of the table; a refusal comes back as { error } alongside it.
+
+export const pokerLobby = () => rpc('poker_lobby')
+export const pokerState = (table) => rpc('poker_state', { p_table: table })
+export const pokerTick = (table) => rpc('poker_tick', { p_table: table })
+export const pokerSit = ({ table, buyIn, seat }) => rpc('poker_sit', { p_table: table, p_buy_in: buyIn, p_seat: seat ?? null })
+export const pokerLeave = (table) => rpc('poker_leave', { p_table: table })
+export const pokerAct = ({ table, action, amount, turn }) => rpc('poker_act', { p_table: table, p_action: action, p_amount: amount ?? null, p_turn: turn ?? null })
+export const pokerAway = ({ table, away }) => rpc('poker_away', { p_table: table, p_away: away })
+export const pokerBuy = ({ table, amount }) => rpc('poker_buy', { p_table: table, p_amount: amount })
+export const pokerProof = (table) => rpc('poker_proof', { p_table: table })
+
+/**
+ * Follows one table live: calls back with each new public row (version and
+ * state, never a hidden card), and with the connection status so the page can
+ * fall back to polling while it is down. Returns an unsubscribe function.
+ */
+export async function subscribePokerTable(table, onRow, onStatus) {
+  const sb = await client()
+  const channel = sb
+    .channel(`table-${table}`)
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'poker_tables', filter: `id=eq.${table}` }, (payload) => onRow(payload.new))
+    .subscribe((status) => onStatus?.(status === 'SUBSCRIBED'))
+  return () => sb.removeChannel(channel)
+}

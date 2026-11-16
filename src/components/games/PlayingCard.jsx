@@ -4,6 +4,10 @@ const RANK_NAMES = { A: 'Ace', J: 'Jack', Q: 'Queen', K: 'King' }
 const FACES = new Set(['J', 'Q', 'K'])
 
 const SIZES = {
+  // For a seat at a shared table, where six players' cards have to fit on a phone.
+  mini: { box: 'h-[3.25rem] w-9', corner: 'text-[11px]', pip: 'text-lg', face: 'text-xl' },
+  // Community cards: mini on a phone, small from there up.
+  board: { box: 'h-[3.25rem] w-9 sm:h-20 sm:w-14', corner: 'text-[11px] sm:text-[13px]', pip: 'text-lg sm:text-2xl', face: 'text-xl sm:text-3xl', suit: 'text-[10px] sm:text-sm' },
   small: { box: 'h-20 w-14', corner: 'text-[13px]', pip: 'text-2xl', face: 'text-3xl' },
   normal: { box: 'h-28 w-20 sm:h-36 sm:w-[6.25rem]', corner: 'text-[15px] sm:text-lg', pip: 'text-3xl sm:text-5xl', face: 'text-4xl sm:text-6xl' },
 }
@@ -11,15 +15,16 @@ const SIZES = {
 /**
  * A playing card with a deal-in animation; `hidden` shows the back and flips
  * over when it turns false. A hidden card's face is left empty so the hole
- * card can't be read from the page. `delay` (ms) staggers the deal.
+ * card can't be read from the page. `delay` (ms) staggers the deal, and
+ * `deal` names the deal-in animation class (each table has its own).
  */
-export default function PlayingCard({ card, hidden = false, index = 0, delay, small = false, covered = false }) {
+export default function PlayingCard({ card, hidden = false, index = 0, delay, small = false, mini = false, size, covered = false, deal = 'pc-deal' }) {
   const red = RED_SUITS.has(card?.suit)
-  const s = SIZES[small ? 'small' : 'normal']
+  const s = SIZES[size ?? (mini ? 'mini' : small ? 'small' : 'normal')]
   const showFace = !hidden && card?.rank
   return (
     <div
-      className={`relative ${s.box} pc-deal [perspective:900px]`}
+      className={`relative ${s.box} ${deal} [perspective:900px]`}
       style={{ animationDelay: `${delay ?? index * 90}ms` }}
       role="img"
       aria-label={showFace ? `${RANK_NAMES[card.rank] ?? card.rank} of ${SUIT_NAMES[card.suit]}` : 'Face-down card'}
@@ -43,7 +48,7 @@ export default function PlayingCard({ card, hidden = false, index = 0, delay, sm
               {FACES.has(card.rank) ? (
                 <span className="absolute inset-[18%_16%] flex flex-col items-center justify-center rounded-md border border-current/25 bg-current/[0.06]">
                   <span className={`font-serif leading-none font-bold ${s.face}`}>{card.rank}</span>
-                  <span className={small ? 'text-sm' : 'text-base sm:text-xl'}>{card.suit}</span>
+                  <span className={s.suit ?? (mini ? 'text-[10px]' : small ? 'text-sm' : 'text-base sm:text-xl')}>{card.suit}</span>
                 </span>
               ) : (
                 <span className={`absolute inset-0 flex items-center justify-center leading-none ${card.rank === 'A' ? s.face : s.pip}`}>{card.suit}</span>

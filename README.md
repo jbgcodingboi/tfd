@@ -26,6 +26,8 @@ npm run dev        # http://localhost:5173
 | `npm run check`   | lint + tests + build                                |
 | `npm run snapshot`| Fetch the Polymarket, Chaminade and stock data into `public/data/` |
 | `npm run test:db` | Database tests for `supabase/schema.sql` on a throwaway local Postgres 16+ |
+| `npm run dev:backend` | A local stand-in for Supabase (the same schema on a throwaway Postgres), for trying backend mode with no project |
+| `npm run test:e2e` | Two phone-sized browsers play Tables against that stand-in (needs Playwright with Chromium installed) |
 | `npm run sync`    | Push prices and results to the Supabase backend by hand (needs the service key) |
 
 Requires Node 20.19+ (Node 22 recommended).
@@ -54,7 +56,7 @@ Requires Node 20.19+ (Node 22 recommended).
   board is kept in the URL (`#/leaderboard?board=games`).
 - **Guest mode**: everything is browsable without an account; trading, the portfolio and resets need one.
 - **Games**: Roulette, Blackjack, Plinko, Dice, Mines, Chicken Cross, Limbo (with Crash) and the Golden Sevens slot,
-  played with your portfolio cash (see below).
+  played with your portfolio cash (see below). With the backend there is also **Tables**, live hold'em between players.
 
 ## How the paper trading math works
 
@@ -203,13 +205,22 @@ sampling, so outcomes are unbiased.
   by one, payline highlights, Big/Mega/Epic win celebrations, turbo spins, autoplay and Space to spin. It replaced
   Boneyard, whose past rounds stay in players' history.
 
+- **Tables** (backend mode only, since it needs other players): live No-Limit Texas Hold'em at shared tables of
+  two to six, at four fixed stakes ($1/$2, $5/$10, $25/$50, $100/$200). A buy-in of 20 to 100 big blinds moves
+  from cash to a table stack and comes back when you leave. There is no rake: every hand's results sum to zero.
+  The database runs the whole game (shuffle, deal, every move, side pots, hand ranking, payouts); the browser only
+  sends fold, check, call, bet, raise, sit and leave, and draws what comes back. Each player has 25 seconds to
+  act; out of time they are checked or folded, and after two timeouts sat out. Guests can watch but not sit (see
+  [Tables](#tables)). The full rule set is the comment at the top of the poker section of `supabase/schema.sql`.
+
 Dice, Limbo, Golden Sevens, Mines and Chicken Cross have **auto play**: a number of bets, raising the bet by a percentage after a win or a
 loss (one click sets up Martingale), and stops at a profit or loss you choose. Mines auto opens the same picked tiles
 every round; Chicken Cross auto cashes out at a lane you choose. Each game has its own small synthesized sounds,
 which can be muted.
 
 Game pages have short addresses: `#/games/spin` (Roulette), `21` (Blackjack), `balls` (Plinko), `roll` (Dice),
-`gems` (Mines), `cross` (Chicken Cross), `target` (Limbo), `rocket` (Crash) and `reels` (Golden Sevens), set in
+`gems` (Mines), `cross` (Chicken Cross), `target` (Limbo), `rocket` (Crash), `reels` (Golden Sevens) and `tables`
+(the card game between players, shown as **Tables**), set in
 `src/games/names.js`. The old addresses named after each game still work and redirect. Game pages share one
 tab title, "Games · Chami Market", and Roulette and Blackjack are shown as **Spin** and **21**.
 
@@ -337,6 +348,36 @@ browser. Connecting a free [Supabase](https://supabase.com) project turns Chami 
 The app picks the mode at build time: with `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` set it uses the
 backend, otherwise it stays in local mode. Accounts made in local mode don't move over; players sign up again.
 
+### Tables
+
+How the multiplayer card game works without a game server:
+
+- **One public row per table** (`public.poker_tables`) holds everything a spectator may see, with a version
+  counter, and is the only poker table in the Realtime publication. Seats, hole cards, the deck and the fairness
+  records live in the `private` schema, which the API does not expose, so no select, filter or Realtime message can
+  return a hidden card. A player's own two cards come from one call (`poker_state`), made when a hand is dealt to
+  them or the page reloads; a refresh mid-hand restores seat and cards.
+- **The clock is lazy.** Every call that touches a table first plays out any turn whose deadline has passed, each
+  timed from the deadline before it. Browsers push the clock (`poker_tick`) when a deadline they can see passes,
+  and a once-a-minute `pg_cron` job (`chami-tables`) does the same for tables nobody is watching, so a table can't
+  get stuck on a player who closed the tab. When Realtime is down the page polls every 2.5 seconds instead.
+- **Chips can't be created or lost.** Every call locks the table row, then the portfolio row, always in that order.
+  Tests check the total after every step of a 2,000 hand random simulation and with eight sessions calling at once.
+- **Fair deals you can check.** The deck is shuffled with the database's cryptographic RNG. Before the deal each
+  card is sealed as `sha256("<salt>:<card>")` and the hash of all 52 seals is published; afterwards "Check the last
+  hand" opens the seals of the cards that were shown (and your own two) in the browser. Mucked and folded hands
+  stay sealed, which is why the whole deck is not simply revealed.
+- **Guests can't sit.** A guest account is free and unlimited, so seats for guests would let anyone pour fresh
+  $100,000 balances into one real account, the same reason guests don't merge into an account on log-in. Players
+  who agree to pass chips to each other still can (as in any play-money card room); buy-ins are capped per table.
+- **A balance reset or a deleted account** takes the player off their table; chips from the old run are dropped.
+- **Message volume**: one Realtime message per subscriber per move, and one feed row per hand (the winner's).
+
+To try it on one machine: `npm run dev:backend`, then in another terminal
+`VITE_SUPABASE_URL=http://127.0.0.1:54321 VITE_SUPABASE_ANON_KEY=local npm run dev`, and open the site in two
+browser profiles (or one normal and one private window). Sign up a different player in each, go to
+Games › Tables, open the same table and sit down in both.
+
 ### Setup
 
 1. **Create a project** at [supabase.com](https://supabase.com) (the free tier is plenty for a small site).
@@ -370,7 +411,8 @@ extra calls do nothing. Its logs are private, under **Edge Functions > sync > Lo
 
 One-time setup:
 
-1. **Turn on the extensions** in Supabase under **Database > Extensions**: **pg_cron** and **pg_net**.
+1. **Turn on the extensions** in Supabase under **Database > Extensions**: **pg_cron** and **pg_net**
+   (pg_cron also runs the once-a-minute `chami-tables` job that keeps unwatched card tables moving).
 2. **Let GitHub deploy the function**: in Supabase, open your account menu > **Access Tokens** and generate a
    token. In GitHub add it under **Settings > Secrets and variables > Actions** as the secret
    `SUPABASE_ACCESS_TOKEN`, and add the variable `SUPABASE_URL` (the Project URL). Then run **Deploy sync
@@ -397,7 +439,10 @@ secret, if you ever need it.
 - **Testing**: `npm run test:db` runs `supabase/tests/schema.test.sql` (sign-up, row level security, trades,
   price checks, settlement, retired parlays, every game with rigged decks, the leaderboard, resets, rate limits and
   recovery codes) against a local Postgres, using `supabase/tests/supabase-stub.sql` in place of Supabase's auth
-  schema. CI runs it on every deploy.
+  schema. For Tables it covers the hand evaluator, blinds and positions, minimum raises, short all-ins, side pots,
+  split pots and odd chips, showing and mucking, timeouts, leaving mid-hand, a 2,000 hand random simulation and
+  checks that no hidden card reaches anon, a spectator or another player; `supabase/tests/tables-concurrency.sql`
+  then plays with eight sessions at once. The whole run takes about a minute and a half. CI runs it on every deploy.
 
 ## Security
 
@@ -468,9 +513,10 @@ src/
   services/backend/  Supabase client: sign-in, portfolio, trades, games, leaderboard, live feed
 supabase/
   schema.sql    Tables, row level security and every server-side money function
-  tests/        Database tests and a local stand-in for Supabase's auth schema
+  tests/        Database tests (schema.test.sql, tables-concurrency.sql) and a local stand-in for Supabase's auth schema
   functions/sync/  The scheduled sync as an Edge Function (built into index.ts by scripts/build-sync-function.mjs)
-scripts/        Snapshot job, the sync (sync-core.mjs, run by the function or sync-backend.mjs) and shared data sources
+scripts/        Snapshot job, the sync (sync-core.mjs, run by the function or sync-backend.mjs), shared data sources,
+                and the local backend stand-in (dev-backend.mjs) with its two-browser Tables check (e2e-tables.mjs)
 ```
 
 ## Assumptions

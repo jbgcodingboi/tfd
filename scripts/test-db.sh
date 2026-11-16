@@ -21,3 +21,13 @@ PSQL=("$BIN/psql" -h "$DIR" -p "$PORT" -U postgres -d postgres -v ON_ERROR_STOP=
 # Applying twice checks the file is safe to re-run after an update.
 "${PSQL[@]}" -f "$ROOT/supabase/schema.sql"
 "${PSQL[@]}" -o /dev/null -f "$ROOT/supabase/tests/schema.test.sql" 2>&1 | sed -e 's/^psql:[^:]*:[0-9]*: NOTICE:  /  /' -e 's/^NOTICE:  /  /'
+# Tables, with several sessions calling at once (see the file for what each part does).
+RACE="$ROOT/supabase/tests/tables-concurrency.sql"
+"${PSQL[@]}" -o /dev/null -v part=setup -f "$RACE"
+pids=()
+for player in 1 1 2 3 4 5 6 0; do
+  "${PSQL[@]}" -o /dev/null -v part=worker -v player="$player" -f "$RACE" &
+  pids+=($!)
+done
+for pid in "${pids[@]}"; do wait "$pid"; done
+"${PSQL[@]}" -o /dev/null -v part=check -f "$RACE" 2>&1 | sed -e 's/^psql:[^:]*:[0-9]*: NOTICE:  /  /' -e 's/^NOTICE:  /  /'
