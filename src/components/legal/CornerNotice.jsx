@@ -26,6 +26,9 @@ export default function CornerNotice() {
   const box = useRef(null)
   // The agreement pop-up says the same thing, so stay out of its way.
   const visible = accepted || pathname === '/terms'
+  // At a card table the controls fill the bottom of the screen, so the notice opens at the top instead
+  // and its shrunken pill steps aside (the notice is also in the footer of every page).
+  const atTable = /^\/games\/tables\/\d+$/.test(pathname)
 
   useEffect(() => {
     if (!visible || touched) return undefined
@@ -50,7 +53,7 @@ export default function CornerNotice() {
   }
 
   return (
-    <aside ref={box} aria-label="Site notice" className="fixed bottom-24 left-3 z-40 max-w-[calc(100vw-1.5rem)] sm:bottom-4 sm:left-4">
+    <aside ref={box} aria-label="Site notice" className={`fixed left-3 z-40 max-w-[calc(100vw-1.5rem)] sm:left-4 ${atTable ? (open ? 'top-28 sm:top-20' : 'hidden') : 'bottom-24 sm:bottom-4'}`}>
       {open ? (
         <div className="w-72 max-w-full animate-fade-in rounded-xl sm:w-80 border border-warn/40 bg-surface/95 p-3 text-xs shadow-xl shadow-black/50 backdrop-blur">
           <div className="flex items-start gap-2">

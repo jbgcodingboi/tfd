@@ -8,6 +8,7 @@ import {
   isValidPortfolio,
   resetPortfolio,
   sanitizePortfolio,
+  tableChipsOf,
 } from '../utils/portfolio.js'
 import { randomId } from '../utils/rng.js'
 import { own } from '../utils/safe.js'
@@ -382,7 +383,7 @@ export const useAccountStore = create((set, get) => ({
 
   netWorth() {
     const { portfolio } = get()
-    return portfolio ? computeNetWorth(portfolio.cash, portfolio.positions, getOutcomePrice) : 0
+    return portfolio ? computeNetWorth(portfolio.cash, portfolio.positions, getOutcomePrice, tableChipsOf(portfolio)) : 0
   },
 
   snapshot({ force = false } = {}) {

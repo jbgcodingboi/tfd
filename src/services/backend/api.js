@@ -279,3 +279,30 @@ export const crashStart = ({ amount, auto }) => rpc('crash_start', { p_amount: a
 export const crashState = () => rpc('crash_state')
 export const crashCashout = () => rpc('crash_cashout')
 export const playSlots = ({ amount }) => rpc('play_slots', { p_amount: amount })
+
+// Tables (the card game between players) ----------------------------------------------
+// Every call answers with the caller's view of the table; a refusal comes back as { error } alongside it.
+
+export const pokerLobby = () => rpc('poker_lobby')
+export const pokerState = (table) => rpc('poker_state', { p_table: table })
+export const pokerTick = (table) => rpc('poker_tick', { p_table: table })
+export const pokerSit = ({ table, buyIn, seat }) => rpc('poker_sit', { p_table: table, p_buy_in: buyIn, p_seat: seat ?? null })
+export const pokerLeave = (table) => rpc('poker_leave', { p_table: table })
+export const pokerAct = ({ table, action, amount, turn }) => rpc('poker_act', { p_table: table, p_action: action, p_amount: amount ?? null, p_turn: turn ?? null })
+export const pokerAway = ({ table, away }) => rpc('poker_away', { p_table: table, p_away: away })
+export const pokerBuy = ({ table, amount }) => rpc('poker_buy', { p_table: table, p_amount: amount })
+export const pokerProof = (table) => rpc('poker_proof', { p_table: table })
+
+/**
+ * Follows one table live: calls back with each new public row (version and
+ * state, never a hidden card), and with the connection status so the page can
+ * fall back to polling while it is down. Returns an unsubscribe function.
+ */
+export async function subscribePokerTable(table, onRow, onStatus) {
+  const sb = await client()
+  const channel = sb
+    .channel(`table-${table}`)
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'poker_tables', filter: `id=eq.${table}` }, (payload) => onRow(payload.new))
+    .subscribe((status) => onStatus?.(status === 'SUBSCRIBED'))
+  return () => sb.removeChannel(channel)
+}

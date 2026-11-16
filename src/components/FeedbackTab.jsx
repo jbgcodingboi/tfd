@@ -110,7 +110,8 @@ export default function FeedbackTab() {
           type="button"
           onClick={() => setOpen(true)}
           aria-haspopup="dialog"
-          className="fixed top-1/2 right-0 z-30 origin-bottom-right -translate-y-1/2 -rotate-90 rounded-t-lg border border-b-0 border-primary-400 bg-surface-2/90 px-3 py-1 text-[11px] font-semibold tracking-wide text-primary-300 shadow-lg shadow-black/40 backdrop-blur transition hover:border-primary-300 hover:text-primary-200"
+          // At a card table on a phone the tab would sit on the right-hand seats; it is back on every other page.
+          className={`fixed top-1/2 right-0 z-30 origin-bottom-right -translate-y-1/2 -rotate-90 rounded-t-lg border border-b-0 border-primary-400 bg-surface-2/90 px-3 py-1 text-[11px] font-semibold tracking-wide text-primary-300 shadow-lg shadow-black/40 backdrop-blur transition hover:border-primary-300 hover:text-primary-200 ${/^\/games\/tables\/\d+$/.test(pathname) ? 'max-sm:hidden' : ''}`}
         >
           Feedback
         </button>

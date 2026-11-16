@@ -30,6 +30,7 @@ const MinesPage = lazy(() => import('./pages/games/MinesPage.jsx'))
 const ChickenPage = lazy(() => import('./pages/games/ChickenPage.jsx'))
 const LimboPage = lazy(() => import('./pages/games/LimboPage.jsx'))
 const SlotsPage = lazy(() => import('./pages/games/SlotsPage.jsx'))
+const TablesPage = lazy(() => import('./pages/games/TablesPage.jsx'))
 const TermsPage = lazy(() => import('./pages/TermsPage.jsx'))
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage.jsx'))
 
@@ -54,6 +55,8 @@ function AppRoutes() {
           <Route path={GAME_PATH.limbo} element={<LimboPage key="limbo" />} />
           <Route path={GAME_PATH.crash} element={<LimboPage key="crash" crash />} />
           <Route path={GAME_PATH.slots} element={<SlotsPage />} />
+          <Route path={GAME_PATH.poker} element={<TablesPage />} />
+          <Route path={`${GAME_PATH.poker}/:tableId`} element={<TablesPage />} />
           {/* Old addresses named after each game (and the retired Boneyard) still land on the right page. */}
           {Object.entries(GAME_PATH).map(([game, to]) => (
             <Route key={game} path={`/games/${game}`} element={<Navigate to={to} replace />} />

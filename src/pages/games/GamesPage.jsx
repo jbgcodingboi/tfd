@@ -7,6 +7,7 @@ import { useGames } from '../../store/gameStore.js'
 import { formatCurrency, formatRelativeTime, formatSignedCurrency, pnlTone } from '../../utils/format.js'
 import { GAME_NAME, GAME_PATH } from '../../games/names.js'
 import GameFeed from '../../components/games/GameFeed.jsx'
+import { BACKEND_ENABLED } from '../../services/backend/config.js'
 
 function RouletteArt() {
   return (
@@ -124,6 +125,30 @@ function SlotsArt() {
   )
 }
 
+function TablesArt() {
+  return (
+    <div className="relative h-24 w-40" aria-hidden="true">
+      <div className="absolute inset-x-2 inset-y-3 rounded-full border-4 border-[#4a2c14] bg-[#0e4a35] shadow-inner" />
+      {[
+        [8, 34], [30, 4], [78, 0], [124, 4], [142, 34], [78, 68],
+      ].map(([x, y], i) => (
+        <span
+          key={i}
+          className={`absolute size-5 rounded-full border-2 border-black/40 transition duration-500 ${i === 5 ? 'bg-warn group-hover:-translate-y-1' : i % 2 ? 'bg-[#2563eb]' : 'bg-primary-400'}`}
+          style={{ left: x, top: y }}
+        />
+      ))}
+      <div className="absolute top-1/2 left-1/2 flex -translate-x-1/2 -translate-y-1/2 gap-0.5">
+        {['A', 'K', 'Q'].map((r, i) => (
+          <span key={r} className={`flex h-7 w-5 items-center justify-center rounded-sm bg-[#fdfbf7] text-[11px] font-bold shadow ${i === 1 ? 'text-[#c0262d]' : 'text-[#1c1917]'}`}>
+            {r}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 const GAMES = [
   {
     to: GAME_PATH.roulette,
@@ -189,6 +214,19 @@ const GAMES = [
     facts: ['Up to 50,000×', 'About 96% return', 'Provably fair'],
     Art: SlotsArt,
   },
+  // Played between signed-in players, so only with the backend.
+  ...(BACKEND_ENABLED
+    ? [
+        {
+          to: GAME_PATH.poker,
+          id: 'poker',
+          title: GAME_NAME.poker,
+          blurb: 'Sit down with other players for live hold’em. Fixed blinds, side pots, and no house cut: every chip lost is won by someone else.',
+          facts: ['2 to 6 players', 'No house cut', 'Sealed decks'],
+          Art: TablesArt,
+        },
+      ]
+    : []),
 ]
 
 const addStats = (a, b) => (a ? { rounds: a.rounds + b.rounds, wagered: a.wagered + b.wagered } : b)
@@ -233,7 +271,7 @@ export default function GamesPage() {
     <div className="mx-auto max-w-7xl px-4 py-6">
       <h1 className="text-2xl font-bold tracking-tight">Games</h1>
       <p className="mt-1 max-w-2xl text-sm text-muted">
-        Eight casino games played with your portfolio cash. Every win and loss moves your net worth and leaderboard rank, just like a trade. Play money
+        Casino games played with your portfolio cash. Every win and loss moves your net worth and leaderboard rank, just like a trade. Play money
         only.
       </p>
       <div className="mt-5 grid gap-6 lg:grid-cols-[minmax(0,1fr)_300px]">
