@@ -712,4 +712,1014 @@ set client_min_messages = warning;
 drop schema net cascade;
 set client_min_messages = notice;
 
+-- Tables (multiplayer poker) ---------------------------------------------------------
+reset role;
+set client_min_messages = warning;
+insert into auth.users (email, raw_user_meta_data) values
+  ('pone@users.test', '{"username":"pone"}'), ('ptwo@users.test', '{"username":"ptwo"}'), ('pthree@users.test', '{"username":"pthree"}'),
+  ('pfour@users.test', '{"username":"pfour"}'), ('pfive@users.test', '{"username":"pfive"}'), ('psix@users.test', '{"username":"psix"}'),
+  ('pseven@users.test', '{"username":"pseven"}');
+insert into auth.users (email, is_anonymous) values (null, true);
+select id as pkguest from auth.users where is_anonymous order by created_at desc, id limit 1 \gset
+
+-- Test players by number, and peeks at what the client roles can't reach.
+create or replace function pg_temp.u(n int) returns uuid language sql security definer as $$
+  select id from public.profiles where username = (array['pone', 'ptwo', 'pthree', 'pfour', 'pfive', 'psix', 'pseven'])[n] $$;
+create or replace function pg_temp.lb() returns jsonb language sql security definer as $$ select private.leaderboard_rows() $$;
+create or replace function pg_temp.rank(p_cards text) returns int[] language sql security definer as $$ select private.poker_rank(string_to_array(p_cards, ' ')) $$;
+-- A table with $50/$100 blinds and any buy-in, so stacks can be whatever a scenario needs.
+create or replace function pg_temp.pk_table(p_seats int default 6) returns bigint language plpgsql security definer as $$
+declare v_id bigint;
+begin
+  insert into public.poker_tables (stake, small_blind, big_blind, min_buy, max_buy, max_seats) values ('test', 50, 100, 1, 1000000, p_seats) returning id into v_id;
+  perform private.poker_publish(v_id);
+  return v_id;
+end $$;
+create or replace function pg_temp.pk_drop(p_table bigint) returns void language sql security definer as $$ delete from public.poker_tables where id = p_table $$;
+create or replace function pg_temp.pk_user(p_table bigint, p_seat int) returns uuid language sql security definer as $$
+  select user_id from private.poker_seats where table_id = p_table and seat = p_seat $$;
+create or replace function pg_temp.pk_seat(p_table bigint, p_seat int) returns jsonb language sql security definer as $$
+  select to_jsonb(s) from private.poker_seats s where table_id = p_table and seat = p_seat $$;
+create or replace function pg_temp.pk_hand(p_table bigint) returns jsonb language sql security definer as $$
+  select to_jsonb(h) from private.poker_hands h where table_id = p_table $$;
+-- Moves a table's clock forward: its deadline and everyone's time away get that much older.
+create or replace function pg_temp.pk_age(p_table bigint, p_secs numeric) returns void language plpgsql security definer as $$
+begin
+  update public.poker_tables set deadline = deadline - make_interval(secs => p_secs) where id = p_table;
+  update private.poker_seats set away_since = away_since - make_interval(secs => p_secs), seen_at = seen_at - make_interval(secs => p_secs) where table_id = p_table;
+end $$;
+create or replace function pg_temp.pk_cash(p_n int) returns numeric language sql security definer as $$ select cash from public.portfolios where user_id = pg_temp.u(p_n) $$;
+create or replace function pg_temp.pk_round(p_n int) returns jsonb language sql security definer as $$
+  select to_jsonb(g) from public.game_rounds g where user_id = pg_temp.u(p_n) order by id desc limit 1 $$;
+create or replace function pg_temp.sha(p text) returns text language sql security definer as $$ select encode(extensions.digest(p, 'sha256'), 'hex') $$;
+-- Where a test player is seated, if anywhere.
+create or replace function pg_temp.pk_where(p_n int) returns jsonb language sql security definer as $$
+  select to_jsonb(s) - 'hole' - 'hole_idx' from private.poker_seats s where user_id = pg_temp.u(p_n) $$;
+-- Deals the next hand now with the button on p_button, then swaps in hole cards ({"<seat>": ["As", "Kd"]}) and a board.
+create or replace function pg_temp.pk_deal(p_table bigint, p_button int, p_holes jsonb default '{}', p_board text[] default null) returns void
+language plpgsql security definer as $$
+declare h private.poker_hands; n int; k text; v jsonb;
+begin
+  select * into h from private.poker_hands where table_id = p_table;
+  if h.table_id is not null and h.street not in ('done', 'idle') then raise exception 'a hand is still being played'; end if;
+  if h.table_id is null then
+    insert into private.poker_hands (table_id, hand_no, street, deck, salts, commits, deck_hash, next_card, button, last_raise)
+    values (p_table, 0, 'idle', '{}', '{}', '{}', '', 0, (p_button + 5) % 6, 0);
+  else
+    update private.poker_hands set button = (p_button + 5) % 6 where table_id = p_table;
+  end if;
+  update public.poker_tables set deadline = now() - interval '2 seconds' where id = p_table;
+  perform private.poker_advance(p_table);
+  select * into h from private.poker_hands where table_id = p_table;
+  if h.street <> 'preflop' or h.button <> p_button then raise exception 'could not deal with the button on seat %: %', p_button, to_jsonb(h) - 'deck' - 'salts' - 'commits'; end if;
+  for k, v in select * from jsonb_each(p_holes) loop
+    update private.poker_seats set hole = array[v ->> 0, v ->> 1] where table_id = p_table and seat = k::int;
+  end loop;
+  if p_board is not null then
+    n := h.next_card;
+    update private.poker_hands set deck[n + 2] = p_board[1], deck[n + 3] = p_board[2], deck[n + 4] = p_board[3], deck[n + 6] = p_board[4], deck[n + 8] = p_board[5]
+    where table_id = p_table;
+  end if;
+end $$;
+-- Every chip the test players own: cash, stacks and what is in the pots.
+create or replace function pg_temp.pk_chips() returns numeric language sql security definer as $$
+  select (select sum(cash) from public.portfolios where user_id in (select pg_temp.u(n) from generate_series(1, 7) n))
+    + (select coalesce(sum(stack + committed), 0) from private.poker_seats) $$;
+-- Every card a client must not see right now: the deck and burn cards, and every hand that hasn't been shown.
+create or replace function pg_temp.pk_hidden(p_table bigint) returns text[] language sql security definer as $$
+  select coalesce(array_agg(c), '{}') from (
+    select unnest(h.deck) as c from private.poker_hands h where h.table_id = p_table and h.street <> 'idle'
+    union select unnest(s.hole) from private.poker_seats s where s.table_id = p_table and s.in_hand
+    except select unnest(h.board) from private.poker_hands h where h.table_id = p_table
+    except select unnest(s.hole) from private.poker_seats s join private.poker_hands h using (table_id) where s.table_id = p_table and s.shown and h.street = 'done') q $$;
+-- Every card named anywhere in a JSON answer.
+create or replace function pg_temp.json_cards(j jsonb) returns text[] language sql as $$
+  select coalesce(array_agg(distinct v #>> '{}'), '{}') from jsonb_path_query(j, '$.** ? (@.type() == "string")') v where v #>> '{}' ~ '^[2-9TJQKA][shdc]$' $$;
+grant execute on function pg_temp.pk_cash(int), pg_temp.pk_round(int), pg_temp.sha(text), pg_temp.pk_where(int), pg_temp.lb(), pg_temp.u(int), pg_temp.rank(text), pg_temp.pk_table(int), pg_temp.pk_drop(bigint), pg_temp.pk_user(bigint, int), pg_temp.pk_seat(bigint, int),
+  pg_temp.pk_hand(bigint), pg_temp.pk_age(bigint, numeric), pg_temp.pk_deal(bigint, int, jsonb, text[]), pg_temp.pk_chips(), pg_temp.pk_hidden(bigint),
+  pg_temp.json_cards(jsonb) to authenticated, anon;
+
+-- The rest run as whoever calls them (a signed-in player), through the public functions only.
+create or replace function pg_temp.pk_as(p_n int) returns void language sql as $$
+  select set_config('request.jwt.claim.sub', pg_temp.u(p_n)::text, false), pg_temp.clear_limits() $$;
+create or replace function pg_temp.pk_state(p_table bigint) returns jsonb language sql as $$ select state from public.poker_tables where id = p_table $$;
+-- Player p_n sits down; fails the test when the server refuses.
+create or replace function pg_temp.pk_sit(p_table bigint, p_n int, p_buy numeric, p_seat int default null) returns jsonb language plpgsql as $$
+declare r jsonb;
+begin
+  perform pg_temp.pk_as(p_n);
+  r := public.poker_sit(p_table, p_buy, p_seat);
+  if r ? 'error' then raise exception 'player % could not sit: %', p_n, r ->> 'error'; end if;
+  return r;
+end $$;
+-- A new test table with players 1..n in seats 0..n-1 holding the given stacks.
+create or replace function pg_temp.pk_setup(p_stacks numeric[]) returns bigint language plpgsql as $$
+declare v_table bigint := pg_temp.pk_table(); i int;
+begin
+  for i in 1..array_length(p_stacks, 1) loop perform pg_temp.pk_sit(v_table, i, p_stacks[i], i - 1); end loop;
+  return v_table;
+end $$;
+-- The player in a seat makes a move. pk_do fails the test when it is refused; pk_err returns the refusal instead.
+create or replace function pg_temp.pk_move(p_table bigint, p_seat int, p_action text, p_amount numeric default null, p_turn int default null) returns jsonb language plpgsql as $$
+begin
+  perform pg_temp.clear_limits();
+  perform set_config('request.jwt.claim.sub', pg_temp.pk_user(p_table, p_seat)::text, false);
+  return public.poker_act(p_table, p_action, p_amount, p_turn);
+end $$;
+create or replace function pg_temp.pk_do(p_table bigint, p_seat int, p_action text, p_amount numeric default null) returns jsonb language plpgsql as $$
+declare r jsonb := pg_temp.pk_move(p_table, p_seat, p_action, p_amount);
+begin
+  if r ? 'error' then raise exception 'seat % could not % %: % (%)', p_seat, p_action, p_amount, r ->> 'error', r -> 'table' -> 'state' -> 'act'; end if;
+  return r -> 'table' -> 'state';
+end $$;
+create or replace function pg_temp.pk_err(p_table bigint, p_seat int, p_action text, p_amount numeric default null, p_turn int default null) returns text language sql as $$
+  select coalesce(pg_temp.pk_move(p_table, p_seat, p_action, p_amount, p_turn) ->> 'error', 'accepted') $$;
+-- Plays moves in order: 'seat:action[:amount]', e.g. '0:raise:300 1:call 2:fold'.
+create or replace function pg_temp.pk_play(p_table bigint, p_moves text) returns jsonb language plpgsql as $$
+declare m text; parts text[]; r jsonb;
+begin
+  foreach m in array string_to_array(p_moves, ' ') loop
+    parts := string_to_array(m, ':');
+    r := pg_temp.pk_do(p_table, parts[1]::int, parts[2], parts[3]::numeric);
+  end loop;
+  return r;
+end $$;
+-- A push of the clock by any signed-in player.
+create or replace function pg_temp.pk_tick(p_table bigint, p_secs numeric) returns jsonb language plpgsql as $$
+begin
+  perform pg_temp.pk_age(p_table, p_secs);
+  perform pg_temp.pk_as(7);
+  perform public.poker_tick(p_table);
+  return pg_temp.pk_state(p_table);
+end $$;
+-- Everyone gets up (between hands) and the table is thrown away.
+create or replace function pg_temp.pk_close(p_table bigint) returns void language plpgsql as $$
+declare i int; r jsonb;
+begin
+  if pg_temp.pk_state(p_table) ->> 'phase' not in ('waiting', 'showdown') then raise exception 'closing table % mid-hand', p_table; end if;
+  for i in 0..5 loop
+    if pg_temp.pk_user(p_table, i) is not null and not (pg_temp.pk_seat(p_table, i) ->> 'leaving')::boolean then
+      perform pg_temp.clear_limits();
+      perform set_config('request.jwt.claim.sub', pg_temp.pk_user(p_table, i)::text, false);
+      r := public.poker_leave(p_table);
+      if r ? 'error' then raise exception 'seat % could not leave: %', i, r ->> 'error'; end if;
+    end if;
+  end loop;
+  perform pg_temp.pk_tick(p_table, 600);
+  perform pg_temp.pk_drop(p_table);
+end $$;
+create or replace function pg_temp.stacks(st jsonb) returns int[] language sql as $$
+  select array_agg(coalesce((s ->> 'stack')::int, -1) order by n) from jsonb_array_elements(st -> 'seats') with ordinality as t(s, n) $$;
+set client_min_messages = notice;
+select pg_temp.pk_chips() as pk_total \gset
+
+-- Hand strength: every category, and the ranks that break ties.
+select pg_temp.ok(pg_temp.rank('As Ks Qs Js Ts 2d 3c') = array[8, 14, 0, 0, 0, 0] and pg_temp.rank('9h 8h 7h 6h 5h As Ad') = array[8, 9, 0, 0, 0, 0]
+  and pg_temp.rank('5h 4h 3h 2h Ah Kd Kc') = array[8, 5, 0, 0, 0, 0], 'straight flushes: royal, nine-high, and the ace playing low');
+select pg_temp.ok(pg_temp.rank('9c 9d 9h 9s Kd Ks 2c') = array[7, 9, 13, 0, 0, 0] and pg_temp.rank('Qs Qh Qd Qc 3s Ah 2d') = array[7, 12, 14, 0, 0, 0],
+  'four of a kind takes the best other card as its kicker');
+select pg_temp.ok(pg_temp.rank('Ks Kh Kd 2c 2d 9s 8s') = array[6, 13, 2, 0, 0, 0] and pg_temp.rank('Ks Kh Kd 9c 9d 9s 2s') = array[6, 13, 9, 0, 0, 0]
+  and pg_temp.rank('Ks Kh Kd 9c 9d 4s 4h') = array[6, 13, 9, 0, 0, 0] and pg_temp.rank('2s 2h 2d Ac Ad Ks Kh') = array[6, 2, 14, 0, 0, 0],
+  'full houses: two sets of three, or three and two pairs, use the best pair');
+select pg_temp.ok(pg_temp.rank('Ah Jh 9h 6h 3h 2h Kd') = array[5, 14, 11, 9, 6, 3] and pg_temp.rank('Ah Kh Qh Jh 9h Td 2c') = array[5, 14, 13, 12, 11, 9],
+  'a flush plays its five highest cards, and beats the straight it also makes');
+select pg_temp.ok(pg_temp.rank('Ts 9d 8h 7c 6s 2d 2c') = array[4, 10, 0, 0, 0, 0] and pg_temp.rank('Ad 2s 3h 4c 5d Kd Qs') = array[4, 5, 0, 0, 0, 0]
+  and pg_temp.rank('Ad Ks Qh Jc Td 2d 3s') = array[4, 14, 0, 0, 0, 0] and pg_temp.rank('Ad 2s 3h 4c 5d 6d Qs') = array[4, 6, 0, 0, 0, 0]
+  and pg_temp.rank('Ts 9d 8h 7c 6s 5d 4c') = array[4, 10, 0, 0, 0, 0] and (pg_temp.rank('Qd Ks Ah 2c 3d 4s 9h'))[1] = 0,
+  'straights: the wheel is five-high, a six-high straight beats it, and K-A-2 does not wrap around');
+select pg_temp.ok(pg_temp.rank('Qs Qh Qd Ac 9d 4s 2h') = array[3, 12, 14, 9, 0, 0], 'three of a kind with two kickers');
+select pg_temp.ok(pg_temp.rank('Ks Kh 4d 4c As 9d 2h') = array[2, 13, 4, 14, 0, 0] and pg_temp.rank('Ks Kh 9d 9c 4s 4h Ad') = array[2, 13, 9, 14, 0, 0]
+  and pg_temp.rank('Ks Kh 9d 9c 4s 4h 3d') = array[2, 13, 9, 4, 0, 0], 'two pair: the best two pairs, and the kicker can come from a third pair');
+select pg_temp.ok(pg_temp.rank('As Ad Kh 9c 5d 3s 2h') = array[1, 14, 13, 9, 5, 0] and pg_temp.rank('As Kd 9h 7c 5d 3s 2h') = array[0, 14, 13, 9, 7, 5],
+  'a pair with three kickers, and high card with five');
+select pg_temp.ok(pg_temp.rank('As Kd Ah 7c 5d 3s 2h') > pg_temp.rank('Ac Qd Ah 7c 5d 3s 2h')
+  and pg_temp.rank('As Kd Ah 7c 5d 3s 2h') = pg_temp.rank('Ac Kh Ah 7c 5d 3s 2h')
+  and pg_temp.rank('Ks Qd Ah Jc 9d 3s 2h') > pg_temp.rank('Kc Qh Ah Jc 8d 3s 2h'), 'kickers decide, down to the fifth card, and equal hands tie whatever the suits');
+select pg_temp.ok(pg_temp.rank('2c 3d As Ks Qs Js Ts') = pg_temp.rank('Ah Ad As Ks Qs Js Ts')
+  and pg_temp.rank('2c 3d Ah Kd Qc Js 9h') = pg_temp.rank('4c 5d Ah Kd Qc Js 9h')
+  and pg_temp.rank('Kh Jd Qs Qh Qd Qc As') = pg_temp.rank('2h 3d Qs Qh Qd Qc As'), 'when the board is the best hand, everyone ties');
+select pg_temp.ok((select bool_and(a > b) from (select pg_temp.rank(h) a, lead(pg_temp.rank(h)) over (order by n) b from unnest(array[
+  '6h 5h 4h 3h 2h', '2c 2d 2h 2s 3d', '2c 2d 2h 3s 3d', '7h 5h 4h 3h 2h', '5c 4d 3h 2s Ad', 'Ac Ad Ah Ks Qd', 'Ac Ad Kh Ks Qd', 'Ac Ad Kh Qs Jd', 'Ac Kd Qh Js 9d'
+  ]) with ordinality as t(h, n)) q where b is not null),
+  'the weakest hand of each category beats the strongest of the next: straight flush, four of a kind, full house, flush, straight, three of a kind, two pair, pair, high card');
+select pg_temp.ok(pg_temp.rank('As Ks Qs Js Ts') = array[8, 14, 0, 0, 0, 0] and pg_temp.rank('As Ad Kh 9c 5d 3s') = array[1, 14, 13, 9, 5, 0], 'five and six cards rank too');
+select pg_temp.expect_error($$select pg_temp.rank('As Ks Qs Js')$$, '%5 to 7 cards%');
+select pg_temp.expect_error($$select pg_temp.rank('As Ks Qs Js 1s')$$, '%Bad card%');
+
+-- The lobby, sitting down and the money ---------------------------------------------
+set role authenticated;
+select pg_temp.pk_as(1);
+select pg_temp.ok((select jsonb_agg(t ->> 'stake') from jsonb_array_elements(public.poker_lobby() -> 'tables') t) = '["micro", "low", "mid", "high"]'
+  and public.poker_lobby() -> 'seat' = 'null' and (public.poker_lobby() ->> 'canSit')::boolean, 'the lobby lists an open table at every stake');
+select (t ->> 'id')::bigint as lowtable from jsonb_array_elements(public.poker_lobby() -> 'tables') t where t ->> 'stake' = 'low' \gset
+do $$
+declare r jsonb; lobby jsonb := public.poker_lobby(); tbl bigint; other bigint; i int; before numeric := (public.get_portfolio() ->> 'cash')::numeric;
+begin
+  select (t ->> 'id')::bigint into tbl from jsonb_array_elements(lobby -> 'tables') t where t ->> 'stake' = 'low';
+  perform pg_temp.ok(public.poker_sit(tbl, 100) ->> 'error' like '%$200 to $1000%' and public.poker_sit(tbl, 1001) ->> 'error' like '%$200 to $1000%'
+    and public.poker_sit(tbl, 250.5) ->> 'error' like '%whole dollars%' and public.poker_sit(tbl, 'NaN') ->> 'error' like '%$200%'
+    and public.poker_sit(tbl, null) ->> 'error' like '%$200%', 'a buy-in is 20 to 100 big blinds in whole dollars');
+  perform pg_temp.ok(public.poker_sit(tbl, 500, 6) ->> 'error' like '%Pick a seat%' and public.poker_sit(-1, 500) ->> 'error' like '%closed%', 'seats and tables must exist');
+  r := public.poker_sit(tbl, 500, 2);
+  perform pg_temp.ok((r -> 'me' ->> 'seat')::int = 2 and (r -> 'me' ->> 'stack')::int = 500 and (r -> 'portfolio' ->> 'cash')::numeric = before - 500
+    and (r -> 'portfolio' ->> 'tableChips')::numeric = 500 and r -> 'table' -> 'state' -> 'seats' -> 2 ->> 'name' = 'pone'
+    and r -> 'table' -> 'state' ->> 'phase' = 'waiting', 'sitting down moves the buy-in from cash to the table');
+  perform pg_temp.ok(public.poker_sit(tbl, 500) ->> 'error' like '%already have a seat%', 'one seat per player');
+  select (t ->> 'id')::bigint into other from jsonb_array_elements(lobby -> 'tables') t where t ->> 'stake' = 'mid';
+  perform pg_temp.ok(public.poker_sit(other, 2000) ->> 'error' like '%already have a seat%', 'at any table');
+  perform pg_temp.ok((public.poker_lobby() -> 'seat' ->> 'table')::bigint = tbl, 'the lobby knows where the player is seated');
+  perform pg_temp.ok(public.poker_buy(tbl, 600) ->> 'error' like '%up to $1000%' and public.poker_buy(tbl, 0.5) ->> 'error' like '%whole number%', 'adding chips stops at the largest buy-in');
+  r := public.poker_buy(tbl, 300);
+  perform pg_temp.ok((r -> 'me' ->> 'stack')::int = 800 and (r -> 'portfolio' ->> 'cash')::numeric = before - 800, 'adding chips moves more cash to the stack');
+  perform pg_temp.pk_as(2);
+  perform pg_temp.ok(public.poker_sit(tbl, 500, 2) ->> 'error' like '%just taken%', 'a taken seat is refused');
+  perform pg_temp.ok(public.poker_leave(tbl) ->> 'error' like '%not seated%' and public.poker_act(tbl, 'fold') ->> 'error' like '%Take a seat%'
+    and public.poker_away(tbl, true) ->> 'error' like '%not seated%' and public.poker_buy(tbl, 100) ->> 'error' like '%not seated%', 'only seated players can act, leave, sit out or add chips');
+  perform pg_temp.pk_as(1);
+  r := public.poker_leave(tbl);
+  perform pg_temp.ok(r -> 'me' = 'null' and (r -> 'portfolio' ->> 'cash')::numeric = before and (r -> 'portfolio' ->> 'tableChips')::numeric = 0
+    and r -> 'table' -> 'state' -> 'seats' -> 2 = 'null', 'leaving moves the whole stack back to cash');
+end $$;
+-- Guests can watch but not sit.
+select set_config('request.jwt.claim.sub', :'pkguest', false);
+select pg_temp.ok(public.poker_sit(:lowtable, 500) ->> 'error' like '%Sign up%' and not (public.poker_lobby() ->> 'canSit')::boolean
+  and public.poker_state(:lowtable) -> 'me' = 'null' and public.poker_state(:lowtable) -> 'table' -> 'state' ->> 'phase' = 'waiting', 'guests can watch a table but not take a seat');
+-- A full table opens another at the same stake; spare empty ones are closed again.
+do $$
+declare tbl bigint; i int; n int;
+begin
+  perform pg_temp.pk_as(1);
+  select (t ->> 'id')::bigint into tbl from jsonb_array_elements(public.poker_lobby() -> 'tables') t where t ->> 'stake' = 'micro';
+  for i in 1..6 loop perform pg_temp.pk_sit(tbl, i, 100); end loop;
+  perform pg_temp.pk_as(7);
+  perform pg_temp.ok(public.poker_sit(tbl, 100) ->> 'error' like '%full%', 'a seventh player finds the table full');
+  select count(*) into n from jsonb_array_elements(public.poker_lobby() -> 'tables') t where t ->> 'stake' = 'micro';
+  perform pg_temp.ok(n = 2 and (select (t ->> 'seated')::int from jsonb_array_elements(public.poker_lobby() -> 'tables') t where (t ->> 'id')::bigint = tbl) = 6,
+    'when every table at a stake is full a new one opens');
+  for i in 1..6 loop
+    perform pg_temp.pk_as(i);
+    perform public.poker_leave(tbl);
+  end loop;
+end $$;
+reset role;
+update public.poker_tables set updated_at = now() - interval '11 minutes' where stake = 'micro';
+select private.poker_sweep() as swept \gset
+select pg_temp.ok((select count(*) from public.poker_tables where stake = 'micro') = 1
+  and (select count(*) from public.poker_tables where stake in ('low', 'mid', 'high')) = 3, 'spare empty tables close after ten minutes; one per stake always stays');
+select pg_temp.ok(pg_temp.pk_chips() = :pk_total, 'sitting, adding chips and leaving never create or lose a chip');
+set role authenticated;
+
+-- A whole three-handed hand: positions, bet sizes, the pot and the records ------------
+do $$
+declare t bigint := pg_temp.pk_setup(array[10000, 10000, 10000]); st jsonb; r jsonb; rounds int;
+begin
+  perform pg_temp.pk_deal(t, 0, '{"0": ["As", "Ah"], "1": ["7c", "2d"], "2": ["Kc", "Qd"]}', array['Kd', '8s', '3h', '4c', '9d']);
+  perform pg_temp.pk_as(1);
+  st := public.poker_state(t) -> 'table' -> 'state';
+  perform pg_temp.ok(st ->> 'phase' = 'preflop' and (st ->> 'button')::int = 0 and (st ->> 'sb')::int = 1 and (st ->> 'bb')::int = 2
+    and pg_temp.stacks(st) = array[10000, 9950, 9900, -1, -1, -1] and (st ->> 'pot')::int = 150 and (st ->> 'bet')::int = 100
+    and st -> 'act' = '{"seat": 0, "toCall": 100, "canRaise": true, "minRaise": 200, "maxRaise": 10000}',
+    'three-handed: blinds sit left of the button and the player after the big blind acts first');
+  perform pg_temp.ok(pg_temp.pk_err(t, 1, 'call') like '%not your turn%' and pg_temp.pk_err(t, 0, 'check') like '%bet to call%'
+    and pg_temp.pk_err(t, 0, 'bet', 300) like '%already a bet%' and pg_temp.pk_err(t, 0, 'raise', 199) like '%smallest raise here is 200%'
+    and pg_temp.pk_err(t, 0, 'raise', 250.5) like '%whole number%' and pg_temp.pk_err(t, 0, 'raise', 10001) like '%that many chips%'
+    and pg_temp.pk_err(t, 0, 'raise', null) like '%whole number%' and pg_temp.pk_err(t, 0, 'shove') like '%Unknown move%'
+    and pg_temp.pk_err(t, 0, null) like '%Unknown move%', 'bad moves are refused with a reason and change nothing');
+  st := pg_temp.pk_do(t, 0, 'raise', 250);
+  perform pg_temp.ok(st -> 'act' = '{"seat": 1, "toCall": 200, "canRaise": true, "minRaise": 400, "maxRaise": 10000}',
+    'after a raise of 150 the next raise must add at least 150');
+  perform pg_temp.ok(pg_temp.pk_err(t, 1, 'raise', 399) like '%smallest raise here is 400%', 'a raise below the minimum is refused');
+  st := pg_temp.pk_play(t, '1:call 2:call');
+  perform pg_temp.ok(st ->> 'phase' = 'flop' and st -> 'board' = '["Kd", "8s", "3h"]' and (st ->> 'pot')::int = 750 and st -> 'pots' = '[750]'
+    and st -> 'act' = '{"seat": 1, "toCall": 0, "canRaise": true, "minRaise": 100, "maxRaise": 9750}', 'the flop: three cards, and the first player after the button acts');
+  perform pg_temp.ok(pg_temp.pk_err(t, 1, 'call') like '%nothing to call%' and pg_temp.pk_err(t, 1, 'raise', 200) like '%Nobody has bet%'
+    and pg_temp.pk_err(t, 1, 'bet', 99) like '%smallest bet here is 100%', 'the smallest bet is the big blind');
+  st := pg_temp.pk_play(t, '1:check 2:bet:100 0:raise:300 1:fold 2:call');
+  perform pg_temp.ok(st ->> 'phase' = 'turn' and jsonb_array_length(st -> 'board') = 4 and (st ->> 'pot')::int = 1350 and (st -> 'act' ->> 'seat')::int = 2
+    and (st -> 'seats' -> 1 ->> 'folded')::boolean, 'the turn: a folded player is skipped');
+  st := pg_temp.pk_play(t, '2:check 0:check 2:check 0:check');
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and pg_temp.stacks(st) = array[10800, 9750, 9450, -1, -1, -1]
+    and st -> 'result' -> 'pots' = '[{"seats": [0, 2], "amount": 1350, "winners": [{"seat": 0, "amount": 1350}]}]'
+    and st -> 'seats' -> 0 -> 'cards' = '["As", "Ah"]' and st -> 'seats' -> 2 -> 'cards' = '["Kc", "Qd"]' and st -> 'seats' -> 1 -> 'cards' = 'null'
+    and st -> 'seats' -> 0 -> 'rank' = '[1, 14, 13, 9, 8, 0]' and (st -> 'seats' -> 0 ->> 'won')::int = 1350,
+    'showdown: the best hand takes the pot and the folded hand stays face down');
+  perform pg_temp.pk_as(1);
+  r := public.get_portfolio();
+  perform pg_temp.ok(r -> 'games' -> 'history' -> 0 ->> 'game' = 'poker' and (r -> 'games' -> 'history' -> 0 ->> 'staked')::numeric = 550
+    and (r -> 'games' -> 'history' -> 0 ->> 'net')::numeric = 800 and r -> 'games' -> 'history' -> 0 ->> 'detail' = 'Won with a pair · $50/$100'
+    and (r ->> 'cash')::numeric = 90000 and (r ->> 'tableChips')::numeric = 10800, 'the winner''s history shows the hand''s net result; the chips stay at the table');
+  perform pg_temp.pk_as(2);
+  r := public.get_portfolio();
+  perform pg_temp.ok((r -> 'games' -> 'history' -> 0 ->> 'net')::numeric = -250 and r -> 'games' -> 'history' -> 0 ->> 'detail' like 'Folded%'
+    and (r -> 'games' -> 'stats' -> 'poker' ->> 'rounds')::int = 1, 'a fold records the chips lost');
+  perform pg_temp.ok((select count(*) from public.activity where game = 'poker') = 1
+    and (select username = 'pone' and net = 800 and detail = 'with a pair ($50/$100)' from public.activity where game = 'poker' order by id desc limit 1),
+    'only the winner goes to the live feed');
+  perform pg_temp.ok((select (x ->> 'netWorth')::numeric = 100800 and (x ->> 'pnl')::numeric = 800 and (x -> 'games' ->> 'net')::numeric = 800 and (x ->> 'marketPnl')::numeric = 0
+    from jsonb_array_elements(pg_temp.lb()) x where x ->> 'name' = 'pone'), 'chips at a table count toward net worth, and the win shows as games winnings on the leaderboard');
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- Heads-up: the button posts the small blind, acts first before the flop and last after it ----
+do $$
+declare t bigint := pg_temp.pk_setup(array[5000, 5000]); st jsonb;
+begin
+  perform pg_temp.pk_deal(t, 0);
+  st := pg_temp.pk_state(t);
+  perform pg_temp.ok((st ->> 'button')::int = 0 and (st ->> 'sb')::int = 0 and (st ->> 'bb')::int = 1 and pg_temp.stacks(st) = array[4950, 4900, -1, -1, -1, -1]
+    and st -> 'act' = '{"seat": 0, "toCall": 50, "canRaise": true, "minRaise": 200, "maxRaise": 5000}', 'heads-up: the button is the small blind and acts first before the flop');
+  st := pg_temp.pk_do(t, 0, 'call');
+  perform pg_temp.ok(st ->> 'phase' = 'preflop' and st -> 'act' = '{"seat": 1, "toCall": 0, "canRaise": true, "minRaise": 200, "maxRaise": 5000}',
+    'the big blind may still raise after a call');
+  st := pg_temp.pk_do(t, 1, 'check');
+  perform pg_temp.ok(st ->> 'phase' = 'flop' and (st -> 'act' ->> 'seat')::int = 1, 'after the flop the big blind acts first and the button last');
+  st := pg_temp.pk_play(t, '1:check 0:check');
+  perform pg_temp.ok(st ->> 'phase' = 'turn' and (st -> 'act' ->> 'seat')::int = 1, 'and on every later round');
+  st := pg_temp.pk_play(t, '1:bet:200 0:fold');
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and not (st -> 'result' ->> 'showdown')::boolean and pg_temp.stacks(st) = array[4900, 5100, -1, -1, -1, -1]
+    and st -> 'seats' -> 1 -> 'cards' = 'null' and st -> 'seats' -> 0 -> 'cards' = 'null' and st -> 'result' -> 'pots' -> 0 ->> 'amount' = '200',
+    'when everyone else folds the winner takes the pot without showing, and the uncalled bet comes back');
+  -- The clock deals the next hand: the button moves to the other player.
+  st := pg_temp.pk_tick(t, 3);
+  perform pg_temp.ok(st ->> 'phase' = 'showdown', 'the finished hand stays on the table for a few seconds');
+  st := pg_temp.pk_tick(t, 5);
+  perform pg_temp.ok(st ->> 'phase' = 'preflop' and (st ->> 'button')::int = 1 and (st ->> 'sb')::int = 1 and (st ->> 'bb')::int = 0 and (st -> 'act' ->> 'seat')::int = 1
+    and (st ->> 'hand')::int = 2, 'the next hand is dealt by the clock and the button moves on');
+  st := pg_temp.pk_do(t, 1, 'fold');
+  perform pg_temp.ok(pg_temp.stacks(st) = array[4950, 5050, -1, -1, -1, -1] and st -> 'result' -> 'players' = '[{"net": 50, "won": 100, "seat": 0}, {"net": -50, "won": 0, "seat": 1}]',
+    'a big blind who is folded to wins the small blind');
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- The big blind raising reopens the betting for the players who only called.
+do $$
+declare t bigint := pg_temp.pk_setup(array[5000, 5000, 5000]); st jsonb;
+begin
+  perform pg_temp.pk_deal(t, 2);
+  st := pg_temp.pk_state(t);
+  perform pg_temp.ok((st ->> 'sb')::int = 0 and (st ->> 'bb')::int = 1 and (st -> 'act' ->> 'seat')::int = 2, 'with the button on the last seat the blinds wrap around');
+  st := pg_temp.pk_play(t, '2:call 0:call 1:raise:400');
+  perform pg_temp.ok(st -> 'act' = '{"seat": 2, "toCall": 300, "canRaise": true, "minRaise": 700, "maxRaise": 5000}', 'a raise from the big blind sends the action round again');
+  st := pg_temp.pk_play(t, '2:fold 0:fold');
+  perform pg_temp.ok(pg_temp.stacks(st) = array[4900, 5200, 4900, -1, -1, -1], 'and takes the calls when both fold');
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- An all-in raise smaller than a full raise does not reopen the betting.
+do $$
+declare t bigint := pg_temp.pk_setup(array[10000, 10000, 250]); st jsonb;
+begin
+  perform pg_temp.pk_deal(t, 0);
+  st := pg_temp.pk_play(t, '0:call 1:call 2:check 1:bet:100');
+  perform pg_temp.ok(st -> 'act' = '{"seat": 2, "toCall": 100, "canRaise": true, "minRaise": 150, "maxRaise": 150}', 'a short stack may go all-in for less than a full raise');
+  st := pg_temp.pk_do(t, 2, 'raise', 150);
+  perform pg_temp.ok(st -> 'seats' -> 2 ->> 'last' = 'allin' and (st -> 'seats' -> 2 ->> 'allIn')::boolean
+    and st -> 'act' = '{"seat": 0, "toCall": 150, "canRaise": true, "minRaise": 250, "maxRaise": 9900}',
+    'a player who has not acted yet may still raise, by at least the last full bet on top');
+  st := pg_temp.pk_do(t, 0, 'call');
+  perform pg_temp.ok(st -> 'act' = '{"seat": 1, "toCall": 50, "canRaise": false, "minRaise": 250, "maxRaise": 9900}', 'the bettor, who already acted, can only call or fold');
+  perform pg_temp.ok(pg_temp.pk_err(t, 1, 'raise', 400) like '%only call or fold%' and pg_temp.pk_err(t, 1, 'check') like '%bet to call%', 'so a raise from them is refused');
+  st := pg_temp.pk_do(t, 1, 'call');
+  perform pg_temp.ok(st ->> 'phase' = 'turn' and (st ->> 'pot')::int = 750 and (st -> 'act' ->> 'seat')::int = 1, 'and the round ends once they call');
+  st := pg_temp.pk_play(t, '1:check 0:check 1:check 0:check');
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and (select sum(x) from unnest(pg_temp.stacks(st)) x where x >= 0) = 20250, 'the pot is paid in full');
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- ...but a full raise from a player yet to act does, and so do short all-ins that add up to a full raise.
+do $$
+declare t bigint := pg_temp.pk_setup(array[10000, 10000, 250]); st jsonb;
+begin
+  perform pg_temp.pk_deal(t, 0);
+  st := pg_temp.pk_play(t, '0:call 1:call 2:check 1:bet:100 2:raise:150 0:raise:250');
+  perform pg_temp.ok(st -> 'act' = '{"seat": 1, "toCall": 150, "canRaise": true, "minRaise": 350, "maxRaise": 9900}', 'a full raise over a short all-in reopens the betting');
+  st := pg_temp.pk_play(t, '1:fold');
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and jsonb_array_length(st -> 'board') = 5 and (st ->> 'runout')::int = 2
+    and st -> 'result' -> 'pots' -> 0 ->> 'amount' = '700' and jsonb_array_length(st -> 'result' -> 'pots') = 1,
+    'with one player left to bet the board runs out, and the uncalled part of the raise goes back');
+  perform pg_temp.pk_close(t);
+end $$;
+
+do $$
+declare t bigint := pg_temp.pk_setup(array[10000, 10000, 250, 300]); st jsonb;
+begin
+  perform pg_temp.pk_deal(t, 0, '{"0": ["Qs", "Qd"], "1": ["7c", "2d"], "2": ["As", "Ad"], "3": ["Ks", "Kd"]}', array['3h', '8c', '9d', 'Jh', '4s']);
+  st := pg_temp.pk_play(t, '3:call 0:call 1:call 2:check 1:bet:100 2:raise:150 3:raise:200');
+  perform pg_temp.ok(st -> 'act' = '{"seat": 0, "toCall": 200, "canRaise": true, "minRaise": 300, "maxRaise": 9900}', 'two short all-ins: 100, then 150, then 200');
+  st := pg_temp.pk_do(t, 0, 'call');
+  perform pg_temp.ok(st -> 'act' = '{"seat": 1, "toCall": 100, "canRaise": true, "minRaise": 300, "maxRaise": 9900}',
+    'short all-ins that add up to a full raise reopen the betting for the first bettor');
+  st := pg_temp.pk_do(t, 1, 'raise', 500);
+  perform pg_temp.ok(st -> 'act' = '{"seat": 0, "toCall": 300, "canRaise": true, "minRaise": 800, "maxRaise": 9900}', 'and their raise of 300 sets the next minimum');
+  st := pg_temp.pk_do(t, 0, 'call');
+  perform pg_temp.ok(st ->> 'phase' = 'turn' and st -> 'pots' = '[1000, 150, 600]' and (st ->> 'pot')::int = 1750, 'three pots: one per all-in size, plus the rest');
+  st := pg_temp.pk_play(t, '1:check 0:check 1:check 0:check');
+  perform pg_temp.ok(st -> 'result' -> 'pots' = '[{"seats": [0, 1, 2, 3], "amount": 1000, "winners": [{"seat": 2, "amount": 1000}]},
+      {"seats": [0, 1, 3], "amount": 150, "winners": [{"seat": 3, "amount": 150}]},
+      {"seats": [0, 1], "amount": 600, "winners": [{"seat": 0, "amount": 600}]}]'
+    and pg_temp.stacks(st) = array[10000, 9400, 1000, 150, -1, -1], 'each pot goes to the best hand among the players who paid into it');
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- Side pots with four all-ins of different sizes, and a bet nobody could match.
+do $$
+declare t bigint := pg_temp.pk_setup(array[1000, 300, 600, 150, 2000]); st jsonb;
+begin
+  perform pg_temp.pk_deal(t, 0, '{"0": ["7c", "2d"], "1": ["Ks", "Kd"], "2": ["Qs", "Qd"], "3": ["As", "Ad"], "4": ["Js", "Jd"]}', array['3h', '8c', '9d', '5h', '4s']);
+  st := pg_temp.pk_do(t, 3, 'raise', 150);
+  perform pg_temp.ok(st -> 'act' = '{"seat": 4, "toCall": 150, "canRaise": true, "minRaise": 250, "maxRaise": 2000}', 'an all-in of 150 over a 100 blind is not a full raise');
+  st := pg_temp.pk_play(t, '4:raise:2000 0:call 1:call 2:call');
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and (st ->> 'runout')::int = 5 and st -> 'board' = '["3h", "8c", "9d", "5h", "4s"]', 'with everyone all-in the whole board is dealt at once');
+  perform pg_temp.ok(st -> 'result' -> 'pots' = '[{"seats": [0, 1, 2, 3, 4], "amount": 750, "winners": [{"seat": 3, "amount": 750}]},
+      {"seats": [0, 1, 2, 4], "amount": 600, "winners": [{"seat": 1, "amount": 600}]},
+      {"seats": [0, 2, 4], "amount": 900, "winners": [{"seat": 2, "amount": 900}]},
+      {"seats": [0, 4], "amount": 800, "winners": [{"seat": 4, "amount": 800}]}]',
+    'four all-ins make four pots, each won by the best hand that paid into it');
+  perform pg_temp.ok(pg_temp.stacks(st) = array[0, 600, 900, 750, 1800, -1], 'the biggest stack gets back the 1,000 nobody could call');
+  perform pg_temp.ok((select bool_and(s -> 'cards' <> 'null') from jsonb_array_elements(st -> 'seats') s where s <> 'null')
+    and (st -> 'seats' -> 0 ->> 'away')::boolean, 'every all-in hand is turned face up, and a player left with no chips sits out');
+  -- The same hand with the best cards on the biggest stack: one player wins every pot.
+  perform pg_temp.pk_as(1);
+  perform pg_temp.ok((public.poker_buy(t, 1000) -> 'me' ->> 'stack')::int = 1000 and not (pg_temp.pk_state(t) -> 'seats' -> 0 ->> 'away')::boolean, 'adding chips brings a busted player back');
+  perform pg_temp.pk_deal(t, 0, '{"0": ["7c", "2d"], "1": ["Ks", "Kd"], "2": ["Qs", "Qd"], "3": ["Js", "Jd"], "4": ["As", "Ad"]}', array['3h', '8c', '9d', '5h', '4s']);
+  st := pg_temp.pk_play(t, '3:raise:750 4:raise:1800 0:call 1:call 2:call');
+  perform pg_temp.ok(pg_temp.stacks(st) = array[0, 0, 0, 0, 5050, -1] and jsonb_array_length(st -> 'result' -> 'pots') = 4
+    and (select sum((p -> 'winners' -> 0 ->> 'amount')::int) from jsonb_array_elements(st -> 'result' -> 'pots') p) = 4250, 'the best hand, when it covers everyone, sweeps all the pots');
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- A tie for the main pot with an odd chip, dead money from a fold, and a side pot.
+do $$
+declare t bigint := pg_temp.pk_setup(array[1000, 1000, 301, 1000]); st jsonb;
+begin
+  perform pg_temp.pk_deal(t, 0, '{"0": ["Qh", "Qc"], "2": ["Ah", "Kc"], "3": ["Ad", "Ks"]}', array['As', '7d', '2c', '9h', '4s']);
+  st := pg_temp.pk_play(t, '3:call 0:call 1:fold 2:raise:301 3:call 0:call 3:bet:100 0:call 3:check 0:check 3:check 0:check');
+  perform pg_temp.ok(st -> 'result' -> 'pots' = '[{"seats": [0, 2, 3], "amount": 953, "winners": [{"seat": 2, "amount": 477}, {"seat": 3, "amount": 476}]},
+      {"seats": [0, 3], "amount": 200, "winners": [{"seat": 3, "amount": 200}]}]',
+    'a tied main pot is split, the odd chip going to the first winner left of the button; the folded blind stays in it');
+  perform pg_temp.ok(pg_temp.stacks(st) = array[599, 950, 477, 1275, -1, -1], 'and the side pot goes to the better of the two who built it');
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- The board plays: three players split, two odd chips.
+do $$
+declare t bigint := pg_temp.pk_setup(array[1000, 1000, 1000, 1000]); st jsonb;
+begin
+  perform pg_temp.pk_deal(t, 0, '{}', array['As', 'Ks', 'Qs', 'Js', 'Ts']);
+  st := pg_temp.pk_play(t, '3:call 0:call 1:fold 2:check 2:check 3:check 0:check 2:check 3:check 0:check 2:check 3:check 0:check');
+  perform pg_temp.ok(st -> 'result' -> 'pots' = '[{"seats": [0, 2, 3], "amount": 350, "winners": [{"seat": 2, "amount": 117}, {"seat": 3, "amount": 117}, {"seat": 0, "amount": 116}]}]'
+    and pg_temp.stacks(st) = array[1016, 950, 1017, 1017, -1, -1], 'a three-way split of 350: the two odd chips go clockwise from the button');
+  perform pg_temp.ok((select count(*) from jsonb_array_elements(st -> 'seats') s where s <> 'null' and s -> 'cards' <> 'null') = 3, 'tying hands are all shown');
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- Who shows and who mucks.
+do $$
+declare t bigint := pg_temp.pk_setup(array[5000, 5000, 5000]); st jsonb; r jsonb;
+begin
+  -- The river is bet: the bettor (kings) shows first, then clockwise. Nines can't win and are mucked; aces show and win.
+  perform pg_temp.pk_deal(t, 0, '{"0": ["9c", "2h"], "1": ["As", "Ah"], "2": ["Kc", "Qd"]}', array['Kd', '9s', '3h', '4c', '7d']);
+  st := pg_temp.pk_play(t, '0:call 1:call 2:check 1:check 2:check 0:check 1:check 2:check 0:check 1:check 2:bet:200 0:call 1:call');
+  perform pg_temp.ok(st -> 'seats' -> 2 -> 'cards' = '["Kc", "Qd"]' and st -> 'seats' -> 1 -> 'cards' = '["As", "Ah"]' and st -> 'seats' -> 0 -> 'cards' = 'null'
+    and st -> 'seats' -> 0 -> 'rank' = 'null' and pg_temp.stacks(st) = array[4700, 5600, 4700, -1, -1, -1],
+    'the river bettor shows first; a caller who is beaten mucks and a caller who wins shows');
+  perform pg_temp.pk_as(2);
+  r := public.poker_state(t);
+  perform pg_temp.ok(not pg_temp.json_cards(r) && array['9c', '2h'] and r -> 'me' -> 'cards' = '["As", "Ah"]', 'the winner never sees the mucked hand');
+  perform pg_temp.pk_as(1);
+  perform pg_temp.ok(public.poker_state(t) -> 'me' -> 'cards' = '["9c", "2h"]', 'its owner still does');
+  perform pg_temp.ok(pg_temp.pk_round(1) ->> 'detail' = 'Lost with a pair · $50/$100', 'and their own history names it');
+  -- The river is checked round: the first player left of the button shows first. Aces there mean nobody else has to show.
+  perform pg_temp.pk_deal(t, 0, '{"0": ["9c", "2h"], "1": ["As", "Ah"], "2": ["Kc", "Qd"]}', array['Kd', '9s', '3h', '4c', '7d']);
+  st := pg_temp.pk_play(t, '0:call 1:call 2:check 1:check 2:check 0:check 1:check 2:check 0:check 1:check 2:check 0:check');
+  perform pg_temp.ok(st -> 'seats' -> 1 -> 'cards' = '["As", "Ah"]' and st -> 'seats' -> 2 -> 'cards' = 'null' and st -> 'seats' -> 0 -> 'cards' = 'null',
+    'after a checked river the first player left of the button shows, and beaten hands behind them muck');
+  -- The same cards with the aces last to show: each hand shown is the best so far, so all three are seen.
+  perform pg_temp.pk_deal(t, 1, '{"1": ["As", "Ah"], "2": ["9c", "2h"], "0": ["Kc", "Qd"]}', array['Kd', '9s', '3h', '4c', '7d']);
+  st := pg_temp.pk_play(t, '1:call 2:call 0:check 2:check 0:check 1:check 2:check 0:check 1:check 2:check 0:check 1:check');
+  perform pg_temp.ok(st -> 'seats' -> 2 -> 'cards' = '["9c", "2h"]' and st -> 'seats' -> 0 -> 'cards' = '["Kc", "Qd"]' and st -> 'seats' -> 1 -> 'cards' = '["As", "Ah"]',
+    'a hand that is the best shown so far is shown, even if a later one beats it');
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- All-in heads-up: calls for less, the refund, and no raise against a player who is all-in.
+do $$
+declare t bigint := pg_temp.pk_setup(array[1000, 300]); st jsonb;
+begin
+  perform pg_temp.pk_deal(t, 0, '{"0": ["As", "Ad"], "1": ["7c", "2d"]}', array['3h', '8c', '9d', 'Jh', '4s']);
+  st := pg_temp.pk_do(t, 0, 'raise', 1000);
+  perform pg_temp.ok(st -> 'act' = '{"seat": 1, "toCall": 200, "canRaise": false, "minRaise": 300, "maxRaise": 300}', 'a short stack can call all-in for less');
+  st := pg_temp.pk_do(t, 1, 'call');
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and pg_temp.stacks(st) = array[1300, 0, -1, -1, -1, -1] and st -> 'result' -> 'pots' -> 0 ->> 'amount' = '600'
+    and st -> 'seats' -> 1 -> 'cards' = '["7c", "2d"]', 'the caller can only lose what they had; the rest of the raise comes back');
+  perform pg_temp.pk_close(t);
+  t := pg_temp.pk_setup(array[5000, 300]);
+  perform pg_temp.pk_deal(t, 0);
+  st := pg_temp.pk_play(t, '0:call 1:raise:300');
+  perform pg_temp.ok(st -> 'act' = '{"seat": 0, "toCall": 200, "canRaise": false, "minRaise": 500, "maxRaise": 5000}'
+    and pg_temp.pk_err(t, 0, 'raise', 600) like '%only call or fold%', 'no raise is offered when every other player is all-in');
+  st := pg_temp.pk_do(t, 0, 'fold');
+  perform pg_temp.ok(pg_temp.stacks(st) = array[4900, 400, -1, -1, -1, -1], 'folding to the all-in gives up the call');
+  perform pg_temp.pk_close(t);
+  -- Blinds bigger than a stack: both post what they have and the hand plays itself.
+  t := pg_temp.pk_setup(array[30, 60]);
+  perform pg_temp.pk_tick(t, 5);
+  st := pg_temp.pk_state(t);
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and (st ->> 'runout')::int = 5 and (select sum(x) from unnest(pg_temp.stacks(st)) x where x >= 0) = 90
+    and st -> 'result' -> 'pots' -> 0 ->> 'amount' = '60', 'players too short for the blinds post what they have and the board runs out');
+  perform pg_temp.pk_close(t);
+end $$;
+reset role;
+select pg_temp.ok(pg_temp.pk_chips() = :pk_total, 'every scenario so far balances to the chip');
+set role authenticated;
+
+-- The clock: nobody can stall a table -------------------------------------------------
+do $$
+declare v_total numeric := pg_temp.pk_chips(); t bigint := pg_temp.pk_setup(array[2000, 2000, 2000]); st jsonb; v bigint; r jsonb;
+  now_ms bigint := (extract(epoch from now()) * 1000)::bigint;
+begin
+  perform pg_temp.pk_deal(t, 0);
+  select version into v from public.poker_tables where id = t;
+  st := pg_temp.pk_tick(t, 20);
+  perform pg_temp.ok((select version from public.poker_tables where id = t) = v and (st -> 'act' ->> 'seat')::int = 0, 'a push before the deadline changes nothing');
+  st := pg_temp.pk_tick(t, 3.5);
+  perform pg_temp.ok((st -> 'act' ->> 'seat')::int = 0, 'a move may arrive up to a second late');
+  st := pg_temp.pk_tick(t, 1);
+  perform pg_temp.ok((st -> 'seats' -> 0 ->> 'folded')::boolean and (st -> 'act' ->> 'seat')::int = 1 and (pg_temp.pk_seat(t, 0) ->> 'timeouts')::int = 1
+    and not (st -> 'seats' -> 0 ->> 'away')::boolean, 'out of time facing a bet: the player is folded and the turn moves on');
+  perform pg_temp.ok((st ->> 'deadline')::bigint between now_ms + 23400 and now_ms + 23600, 'the next turn is timed from the deadline that ran out, not from the late push');
+  st := pg_temp.pk_do(t, 1, 'call');
+  st := pg_temp.pk_tick(t, 27);
+  perform pg_temp.ok(st ->> 'phase' = 'flop' and not (st -> 'seats' -> 2 ->> 'folded')::boolean and (pg_temp.pk_seat(t, 2) ->> 'timeouts')::int = 1,
+    'out of time with nothing to call: the player is checked, not folded');
+  st := pg_temp.pk_do(t, 1, 'bet', 100);
+  st := pg_temp.pk_tick(t, 27);
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and (st -> 'seats' -> 2 ->> 'away')::boolean and pg_temp.stacks(st) = array[2000, 2100, 1900, -1, -1, -1],
+    'a second timeout in a row sits the player out');
+  st := pg_temp.pk_tick(t, 10);
+  perform pg_temp.ok(st ->> 'phase' = 'preflop' and not (st -> 'seats' -> 2 ->> 'inHand')::boolean and (st -> 'seats' -> 0 ->> 'inHand')::boolean
+    and (st -> 'seats' -> 1 ->> 'inHand')::boolean and (st ->> 'button')::int = 1, 'a player sitting out is not dealt in; the others play on');
+  st := pg_temp.pk_play(t, '1:call 0:check');
+  perform pg_temp.ok((pg_temp.pk_seat(t, 0) ->> 'timeouts')::int = 0, 'a move made in time clears the count');
+  perform pg_temp.pk_as(3);
+  perform pg_temp.ok(public.poker_act(t, 'check') ->> 'error' like '%not your turn%', 'a player sitting out has no turn');
+  r := public.poker_away(t, false);
+  perform pg_temp.ok(not (r -> 'me' ->> 'away')::boolean and not (r -> 'table' -> 'state' -> 'seats' -> 2 ->> 'away')::boolean, 'coming back is one call');
+  r := public.poker_away(t, true);
+  r := public.poker_away(t, false);
+  -- Everyone walks away mid-hand. One push an hour later plays the whole table out.
+  st := pg_temp.pk_tick(t, 3600);
+  perform pg_temp.ok(st ->> 'phase' = 'waiting' and st -> 'seats' = '[null, null, null, null, null, null]' and st -> 'deadline' = 'null'
+    and (select seated from public.poker_tables where id = t) = 0, 'an abandoned table plays itself out and every seat is freed');
+  perform pg_temp.ok(pg_temp.pk_chips() = v_total and pg_temp.pk_where(1) is null and pg_temp.pk_where(2) is null and pg_temp.pk_where(3) is null, 'and every stack is back in its owner''s cash');
+  perform pg_temp.pk_drop(t);
+end $$;
+
+-- A lone player who closes the tab doesn't hold the seat; one whose browser keeps asking does.
+do $$
+declare c1 numeric := pg_temp.pk_cash(1); t bigint := pg_temp.pk_setup(array[2000]); st jsonb;
+begin
+  perform pg_temp.ok(pg_temp.pk_state(t) -> 'deadline' <> 'null', 'a table with someone seated is looked at again in a few minutes');
+  perform pg_temp.pk_age(t, 100);
+  perform pg_temp.pk_as(1);
+  perform public.poker_state(t);
+  st := pg_temp.pk_tick(t, 100);
+  perform pg_temp.ok(st -> 'seats' -> 0 ->> 'name' = 'pone', 'a player whose browser is still there keeps the seat while waiting');
+  st := pg_temp.pk_tick(t, 200);
+  perform pg_temp.ok(st -> 'seats' -> 0 = 'null' and pg_temp.pk_cash(1) = c1, 'three minutes of silence frees the seat and returns the chips');
+  perform pg_temp.pk_drop(t);
+end $$;
+
+-- A late or repeated click can't be played as the next decision.
+do $$
+declare t bigint := pg_temp.pk_setup(array[2000, 2000]); st jsonb; v_turn int;
+begin
+  perform pg_temp.pk_deal(t, 0);
+  v_turn := (pg_temp.pk_state(t) ->> 'turn')::int;
+  perform pg_temp.ok(pg_temp.pk_err(t, 0, 'call', null, v_turn - 1) like '%earlier turn%', 'a move for an earlier turn is refused');
+  perform pg_temp.ok(pg_temp.pk_err(t, 0, 'call', null, v_turn) = 'accepted' and pg_temp.pk_err(t, 0, 'call', null, v_turn) like '%not your turn%', 'a double click plays once');
+  st := pg_temp.pk_play(t, '1:check 1:check');
+  perform pg_temp.ok((st -> 'act' ->> 'seat')::int = 0 and pg_temp.pk_err(t, 0, 'check', null, v_turn) like '%earlier turn%'
+    and (pg_temp.pk_state(t) -> 'act' ->> 'seat')::int = 0, 'and a stale copy of it is not played when the turn comes round again');
+  st := pg_temp.pk_play(t, '0:check 1:check 0:check 1:check 0:check');
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- Leaving and joining ---------------------------------------------------------------
+do $$
+declare c2 numeric := pg_temp.pk_cash(2); c3 numeric := pg_temp.pk_cash(3); t bigint := pg_temp.pk_setup(array[3000, 3000, 3000]); st jsonb; r jsonb; v_turn int; v_deadline text;
+begin
+  perform pg_temp.pk_deal(t, 0);
+  st := pg_temp.pk_state(t);
+  v_turn := (st ->> 'turn')::int;
+  v_deadline := st ->> 'deadline';
+  -- The big blind leaves while it is someone else's turn.
+  perform pg_temp.pk_as(3);
+  r := public.poker_leave(t);
+  st := r -> 'table' -> 'state';
+  perform pg_temp.ok((r -> 'portfolio' ->> 'cash')::numeric = c3 - 100 and (r -> 'me' ->> 'left')::boolean and (st -> 'seats' -> 2 ->> 'folded')::boolean
+    and (st -> 'seats' -> 2 ->> 'left')::boolean and (st ->> 'turn')::int = v_turn and st ->> 'deadline' = v_deadline and (st -> 'act' ->> 'seat')::int = 0,
+    'leaving mid-hand folds at once and returns the stack; the blind stays in the pot and the turn is undisturbed');
+  perform pg_temp.ok(public.poker_sit(t, 500) ->> 'error' like '%still finishing%' and public.poker_leave(t) ->> 'error' like '%not seated%'
+    and (public.poker_lobby() -> 'seat') = 'null', 'the seat is theirs until the hand ends, but only to finish it');
+  -- A fourth player sits down during the hand: they wait for the next one.
+  r := pg_temp.pk_sit(t, 4, 1000, 4);
+  perform pg_temp.ok(not (r -> 'table' -> 'state' -> 'seats' -> 4 ->> 'inHand')::boolean and r -> 'me' -> 'cards' = 'null' and (r -> 'table' -> 'state' ->> 'turn')::int = v_turn,
+    'a player who sits down during a hand is not in it');
+  st := pg_temp.pk_do(t, 0, 'raise', 300);
+  -- The small blind leaves on their own turn: one player is left and wins.
+  perform pg_temp.pk_as(2);
+  r := public.poker_leave(t);
+  st := r -> 'table' -> 'state';
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and pg_temp.stacks(st) = array[3150, 0, 0, -1, 1000, -1] and (r -> 'portfolio' ->> 'cash')::numeric = c2 - 50,
+    'when leaving leaves one player in the hand, they win it');
+  st := pg_temp.pk_tick(t, 10);
+  perform pg_temp.ok(st -> 'seats' -> 1 = 'null' and st -> 'seats' -> 2 = 'null' and st ->> 'phase' = 'preflop' and (st -> 'seats' -> 4 ->> 'inHand')::boolean,
+    'the seats are freed for the next hand, which deals the newcomer in');
+  perform pg_temp.ok((pg_temp.pk_round(3) ->> 'net')::numeric = -100
+    and (pg_temp.pk_round(2) ->> 'net')::numeric = -50, 'a hand left mid-way is recorded like any fold');
+  -- Sitting out by choice: this hand is played normally, the next one skips them.
+  perform pg_temp.pk_as(4);
+  r := public.poker_away(t, true);
+  perform pg_temp.ok((r -> 'me' ->> 'away')::boolean and (r -> 'table' -> 'state' -> 'seats' -> 4 ->> 'inHand')::boolean, 'sitting out takes effect from the next hand');
+  st := pg_temp.pk_state(t);
+  st := pg_temp.pk_do(t, (st -> 'act' ->> 'seat')::int, 'fold');
+  st := pg_temp.pk_tick(t, 10);
+  perform pg_temp.ok(st ->> 'phase' = 'waiting' and (st -> 'seats' -> 4 ->> 'away')::boolean, 'with one player ready there is no hand to deal');
+  perform pg_temp.pk_as(4);
+  r := public.poker_away(t, false);
+  st := pg_temp.pk_tick(t, 5);
+  perform pg_temp.ok(not r ? 'error' and st ->> 'phase' = 'preflop', 'and it resumes when they are back');
+  st := pg_temp.pk_do(t, (st -> 'act' ->> 'seat')::int, 'fold');
+  perform pg_temp.pk_close(t);
+
+  -- An all-in player who leaves is still in for the pot; the winnings follow them out.
+  c2 := pg_temp.pk_cash(2);
+  t := pg_temp.pk_setup(array[3000, 500]);
+  perform pg_temp.pk_deal(t, 0, '{"0": ["7c", "2d"], "1": ["As", "Ad"]}', array['3h', '8c', '9d', 'Jh', '4s']);
+  st := pg_temp.pk_play(t, '0:call 1:raise:500');
+  perform pg_temp.pk_as(2);
+  r := public.poker_leave(t);
+  perform pg_temp.ok((r -> 'me' ->> 'left')::boolean and not (r -> 'table' -> 'state' -> 'seats' -> 1 ->> 'folded')::boolean
+    and (r -> 'portfolio' ->> 'cash')::numeric = c2 - 500, 'an all-in player who leaves is not folded');
+  st := pg_temp.pk_do(t, 0, 'call');
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and (st -> 'seats' -> 1 ->> 'won')::int = 1000, 'and still wins the pot');
+  st := pg_temp.pk_tick(t, 12);
+  perform pg_temp.ok(st -> 'seats' -> 1 = 'null' and pg_temp.pk_cash(2) = c2 + 500, 'which goes to their cash when the seat is freed');
+  perform pg_temp.pk_close(t);
+end $$;
+reset role;
+select pg_temp.ok(pg_temp.pk_chips() = :pk_total, 'timeouts, leaving and joining balance to the chip');
+
+-- Hidden cards never leave the server ---------------------------------------------------
+select pg_temp.ok((select array_agg(tablename::text order by tablename) from pg_publication_tables where pubname = 'supabase_realtime' and tablename like 'poker%') = array['poker_tables']
+  and not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and schemaname <> 'public'),
+  'Realtime publishes the public table row and nothing from the private schema');
+select pg_temp.ok((select array_agg(column_name::text order by column_name::text) from information_schema.column_privileges
+    where table_schema = 'public' and table_name = 'poker_tables' and grantee = 'anon' and privilege_type = 'SELECT')
+  = array['big_blind', 'deadline', 'hand_no', 'id', 'max_buy', 'max_seats', 'min_buy', 'seated', 'small_blind', 'stake', 'state', 'updated_at', 'version']
+  and not exists (select 1 from information_schema.table_privileges where table_name like 'poker%' and grantee in ('anon', 'authenticated', 'PUBLIC'))
+  and not exists (select 1 from information_schema.column_privileges where table_name like 'poker%' and grantee in ('anon', 'authenticated', 'PUBLIC') and privilege_type <> 'SELECT'),
+  'clients may read thirteen named columns of the public table row and can write nothing');
+select pg_temp.ok(not exists (select 1 from information_schema.routine_privileges where routine_schema = 'private' and grantee in ('anon', 'authenticated', 'PUBLIC'))
+  and not has_schema_privilege('anon', 'private', 'usage') and not has_schema_privilege('authenticated', 'private', 'usage'),
+  'no client role can reach the private schema or call anything in it');
+set role anon;
+select set_config('request.jwt.claim.sub', '', false);
+select pg_temp.ok((select count(*) from (select id, state, version from public.poker_tables) t) >= 4, 'anyone can read the public state of the tables');
+select pg_temp.expect_error($$select * from public.poker_tables$$, '%permission denied%');
+select pg_temp.expect_error($$update public.poker_tables set state = '{}'$$, '%permission denied%');
+select pg_temp.expect_error($$insert into public.poker_tables (stake, small_blind, big_blind, min_buy, max_buy) values ('x', 1, 2, 3, 4)$$, '%permission denied%');
+select pg_temp.expect_error($$delete from public.poker_tables$$, '%permission denied%');
+select pg_temp.expect_error($$select * from private.poker_seats$$, '%permission denied%');
+select pg_temp.expect_error($$select hole from private.poker_seats$$, '%permission denied%');
+select pg_temp.expect_error($$select deck from private.poker_hands$$, '%permission denied%');
+select pg_temp.expect_error($$select * from private.poker_proofs$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_lobby()$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_state(1)$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_tick(1)$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_sit(1, 100)$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_leave(1)$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_act(1, 'fold')$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_away(1, true)$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_buy(1, 100)$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_proof(1)$$, '%permission denied%');
+reset role;
+set role authenticated;
+select pg_temp.pk_as(7);
+select pg_temp.expect_error($$select * from public.poker_tables$$, '%permission denied%');
+select pg_temp.expect_error($$update public.poker_tables set state = '{}'$$, '%permission denied%');
+select pg_temp.expect_error($$select * from private.poker_seats$$, '%permission denied%');
+select pg_temp.expect_error($$select deck, salts from private.poker_hands$$, '%permission denied%');
+select pg_temp.expect_error($$select holes from private.poker_proofs$$, '%permission denied%');
+select pg_temp.expect_error($$select private.poker_view(1, auth.uid())$$, '%permission denied%');
+select pg_temp.expect_error($$select private.poker_shuffle()$$, '%permission denied%');
+select pg_temp.expect_error($$select private.poker_publish(1)$$, '%permission denied%');
+select pg_temp.expect_error($$select private.poker_advance(1)$$, '%permission denied%');
+select pg_temp.expect_error($$select private.poker_cashout(1, 0)$$, '%permission denied%');
+select pg_temp.expect_error($$select private.poker_evict(auth.uid())$$, '%permission denied%');
+select pg_temp.expect_error($$select private.poker_sweep()$$, '%permission denied%');
+select pg_temp.expect_error($$select private.game_record(auth.uid(), 1, 'poker', 0, 1000000, 'free money')$$, '%permission denied%');
+select pg_temp.ok(true, 'anon can call no table function; signed-in players only the public ones; nobody can read seats, decks or fairness records directly');
+
+-- Checks one answer from the server: it may name the board, hands shown at a finished showdown, and the asker's own two cards (p_own). Nothing else.
+reset role;
+create or replace function pg_temp.pk_hole(p_table bigint, p_n int) returns text[] language sql security definer as $$
+  select coalesce((select hole from private.poker_seats where table_id = p_table and user_id = pg_temp.u(p_n) and in_hand), '{}') $$;
+create or replace function pg_temp.pk_hole_at(p_table bigint, p_seat int) returns text[] language sql security definer as $$
+  select coalesce((select hole from private.poker_seats where table_id = p_table and seat = p_seat and in_hand), '{}') $$;
+create or replace function pg_temp.pk_no_leak(p_table bigint, p_answer jsonb, p_own text[], p_what text) returns void language plpgsql as $$
+declare v_bad text[];
+begin
+  select array_agg(c) into v_bad from unnest(pg_temp.json_cards(p_answer)) c where c = any (pg_temp.pk_hidden(p_table)) and c <> all (p_own);
+  if v_bad is not null then raise exception 'LEAK: % shows %: %', p_what, v_bad, p_answer; end if;
+end $$;
+grant execute on function pg_temp.pk_hole(bigint, int), pg_temp.pk_hole_at(bigint, int) to authenticated;
+set role authenticated;
+
+-- Fairness: the deck is sealed before the deal and the shown cards can be checked afterwards.
+do $$
+declare t bigint := pg_temp.pk_setup(array[2000, 2000, 2000]); st jsonb; v_hash text; p jsonb; mine jsonb; shown text[]; i int; r jsonb; v_seat int; v_mucked int[];
+begin
+  st := pg_temp.pk_tick(t, 5);
+  v_hash := st ->> 'deckHash';
+  perform pg_temp.ok(st ->> 'phase' = 'preflop' and v_hash ~ '^[0-9a-f]{64}$', 'the hash of the sealed deck is published with the deal');
+  perform pg_temp.pk_as(7);
+  perform pg_temp.ok(jsonb_array_length(public.poker_proof(t) -> 'commits') is null and public.poker_proof(t) ->> 'error' like '%No finished hand%', 'there is nothing to check until a hand has finished');
+  -- Every answer during the hand, to a spectator and to each player.
+  for i in 1..40 loop
+    exit when st ->> 'phase' = 'showdown';
+    v_seat := (st -> 'act' ->> 'seat')::int;
+    r := pg_temp.pk_move(t, v_seat, case when (st -> 'act' ->> 'toCall')::int > 0 then 'call' else 'check' end);
+    perform pg_temp.pk_no_leak(t, r, pg_temp.pk_hole_at(t, v_seat), 'a move');
+    perform pg_temp.pk_no_leak(t, pg_temp.pk_move(t, (v_seat + 1) % 3, 'raise', 99999), pg_temp.pk_hole_at(t, (v_seat + 1) % 3), 'a refused move');
+    st := pg_temp.pk_state(t);
+    perform pg_temp.pk_no_leak(t, to_jsonb((select tt from (select id, stake, small_blind, big_blind, min_buy, max_buy, max_seats, seated, version, hand_no, deadline, state, updated_at
+      from public.poker_tables where id = t) tt)), '{}', 'the public row');
+    perform pg_temp.pk_as(7);
+    perform pg_temp.pk_no_leak(t, public.poker_state(t), '{}', 'a spectator''s view');
+    perform pg_temp.pk_no_leak(t, public.poker_tick(t), '{}', 'a clock push');
+    perform pg_temp.pk_no_leak(t, public.poker_lobby(), '{}', 'the lobby');
+    perform pg_temp.pk_no_leak(t, public.poker_proof(t), '{}', 'the fairness record');
+    perform pg_temp.pk_no_leak(t, public.poker_sit(t, 0), '{}', 'a refused seat');
+    perform pg_temp.pk_as(2);
+    r := public.poker_state(t);
+    perform pg_temp.pk_no_leak(t, r, pg_temp.pk_hole(t, 2), 'a player''s view');
+    if r -> 'me' -> 'cards' is distinct from pg_temp.pk_seat(t, 1) -> 'hole' or jsonb_array_length(r -> 'me' -> 'cards') <> 2 then
+      raise exception 'a player should see their own two cards: %', r -> 'me';
+    end if;
+  end loop;
+  perform pg_temp.ok(true, 'through a whole hand, every answer to a spectator and to each player names only the board and that player''s own two cards');
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and st ->> 'deckHash' = v_hash, 'the hand was played to a showdown under the same seal');
+  select array_agg(c) into shown from (select jsonb_array_elements_text(st -> 'board') c union
+    select jsonb_array_elements_text(s -> 'cards') from jsonb_array_elements(st -> 'seats') s where s <> 'null' and s -> 'cards' <> 'null') q;
+  select array_agg(n - 1) into v_mucked from jsonb_array_elements(st -> 'seats') with ordinality as q(s, n) where s <> 'null' and s -> 'cards' = 'null';
+  perform pg_temp.pk_as(7);
+  p := public.poker_proof(t);
+  perform pg_temp.ok(pg_temp.sha((select string_agg(c, ',' order by n) from jsonb_array_elements_text(p -> 'commits') with ordinality as q(c, n))) = v_hash
+    and jsonb_array_length(p -> 'commits') = 52 and (p ->> 'hand')::int = (st ->> 'hand')::int and p ->> 'deckHash' = v_hash,
+    'afterwards the 52 seals hash to the value published before the deal');
+  perform pg_temp.ok((select bool_and(pg_temp.sha((x ->> 'salt') || ':' || (x ->> 'card')) = p -> 'commits' ->> ((x ->> 'i')::int - 1)) from jsonb_array_elements(p -> 'reveals') x),
+    'every revealed card opens its seal');
+  perform pg_temp.ok((select array_agg(x ->> 'card' order by x ->> 'card') from jsonb_array_elements(p -> 'reveals') x) = (select array_agg(c order by c) from unnest(shown) c)
+    and (select count(distinct x ->> 'i') from jsonb_array_elements(p -> 'reveals') x) = array_length(shown, 1),
+    'a spectator gets the board and the hands that were shown, and nothing else');
+  -- Board cards sit where the deal puts them: after two cards each, one burned before the flop, the turn and the river.
+  perform pg_temp.ok((select array_agg((x ->> 'i')::int order by (x ->> 'i')::int) from jsonb_array_elements(p -> 'reveals') x where x ->> 'card' = any (select jsonb_array_elements_text(st -> 'board')))
+    = array[8, 9, 10, 12, 14], 'the board comes from the deck positions the deal fixes (a card is burned before each street)');
+  perform pg_temp.pk_no_leak(t, p, '{}', 'the fairness record after the hand');
+  perform pg_temp.pk_as(1);
+  mine := public.poker_state(t) -> 'me' -> 'cards';
+  p := public.poker_proof(t);
+  perform pg_temp.ok((select count(*) from jsonb_array_elements(p -> 'reveals') x where mine ? (x ->> 'card')) = 2
+    and (select bool_and(pg_temp.sha((x ->> 'salt') || ':' || (x ->> 'card')) = p -> 'commits' ->> ((x ->> 'i')::int - 1)) from jsonb_array_elements(p -> 'reveals') x),
+    'a player can also open the seals of their own two cards, shown or not');
+  perform pg_temp.pk_no_leak(t, p, pg_temp.pk_hole(t, 1), 'a player''s fairness record');
+  -- The seal of each card is hiding: the same card gets a different seal every hand.
+  st := pg_temp.pk_tick(t, 12);
+  perform pg_temp.ok(st ->> 'deckHash' <> v_hash and st ->> 'phase' = 'preflop', 'the next hand has a new seal');
+  st := pg_temp.pk_play(t, format('%s:fold', st -> 'act' ->> 'seat'));
+  st := pg_temp.pk_play(t, format('%s:fold', st -> 'act' ->> 'seat'));
+  perform pg_temp.pk_close(t);
+end $$;
+
+-- Every table call is rate limited.
+do $$
+declare i int; t bigint := pg_temp.pk_table();
+begin
+  perform pg_temp.pk_as(7);
+  for i in 1..40 loop perform public.poker_lobby(); end loop;
+  perform pg_temp.expect_error($q$select public.poker_lobby()$q$, '%Slow down%');
+  for i in 1..150 loop perform public.poker_state(t); end loop;
+  perform pg_temp.expect_error(format($q$select public.poker_state(%s)$q$, t), '%Slow down%');
+  for i in 1..60 loop perform public.poker_tick(t); end loop;
+  perform pg_temp.expect_error(format($q$select public.poker_tick(%s)$q$, t), '%Slow down%');
+  for i in 1..90 loop perform public.poker_act(t, 'fold'); end loop;
+  perform pg_temp.expect_error(format($q$select public.poker_act(%s, 'fold')$q$, t), '%Slow down%');
+  for i in 1..10 loop
+    perform public.poker_sit(t, 0);
+    perform public.poker_leave(t);
+    perform public.poker_away(t, true);
+  end loop;
+  perform pg_temp.expect_error(format($q$select public.poker_buy(%s, 100)$q$, t), '%Slow down%');
+  perform pg_temp.expect_error(format($q$select public.poker_sit(%s, 100)$q$, t), '%Slow down%');
+  perform pg_temp.expect_error(format($q$select public.poker_leave(%s)$q$, t), '%Slow down%');
+  perform pg_temp.expect_error(format($q$select public.poker_away(%s, false)$q$, t), '%Slow down%');
+  for i in 1..20 loop perform public.poker_proof(t); end loop;
+  perform pg_temp.expect_error(format($q$select public.poker_proof(%s)$q$, t), '%Slow down%');
+  perform pg_temp.clear_limits();
+  perform pg_temp.pk_drop(t);
+  perform pg_temp.ok(true, 'every table call is rate limited, refused calls included');
+end $$;
+
+-- Thousands of random hands: every chip is accounted for after every move, every hand finishes, no hidden card is ever sent.
+-- It runs in batches, each its own transaction, the way real calls arrive (and so the table rows it rewrites can be tidied up as it goes).
+reset role;
+create temp table pk_sim (hands int, moves int, allins int, timeouts int, leaves int, showdowns int, side int, splits int, mucks int);
+insert into pk_sim values (0, 0, 0, 0, 0, 0, 0, 0, 0);
+grant select, update on pk_sim to authenticated;
+create or replace function pg_temp.pk_sim(t bigint, p_hands int) returns void language plpgsql as $$
+declare v_total numeric := pg_temp.pk_chips(); v_target int; v_step int := 0; st jsonb; act jsonb; r jsonb; w jsonb; p jsonb;
+  v_seat int; v_n int; x float8; v_min bigint; v_max bigint; v_call bigint; v_amt bigint; v_can boolean; v_move text; v_phase text; v_cash numeric;
+  v_hand int; v_showdowns int := 0; v_side int := 0; v_splits int := 0; v_timeouts int := 0; v_leaves int := 0; v_allins int := 0; v_moves int := 0; v_mucks int := 0;
+begin
+  v_hand := (pg_temp.pk_state(t) ->> 'hand')::int;
+  v_target := v_hand + p_hands;
+  loop
+    v_step := v_step + 1;
+    st := pg_temp.pk_state(t);
+    v_phase := st ->> 'phase';
+    exit when (st ->> 'hand')::int >= v_target and v_phase in ('showdown', 'waiting');
+    if v_step > p_hands * 80 then raise exception 'the simulation is not getting anywhere: %', st; end if;
+
+    if v_phase in ('showdown', 'waiting') then
+      if v_phase = 'showdown' and (st ->> 'hand')::int <> v_hand then
+        v_hand := (st ->> 'hand')::int;
+        -- No rake: the hand's results add up to zero and every pot is paid out exactly.
+        if (select sum((q ->> 'net')::numeric) from jsonb_array_elements(st -> 'result' -> 'players') q) <> 0
+          or (select sum((q ->> 'amount')::numeric) from jsonb_array_elements(st -> 'result' -> 'pots') q)
+            <> (select sum((q ->> 'won')::numeric) from jsonb_array_elements(st -> 'result' -> 'players') q)
+          or exists (select 1 from jsonb_array_elements(st -> 'result' -> 'pots') q
+            where (q ->> 'amount')::numeric <> (select sum((z ->> 'amount')::numeric) from jsonb_array_elements(q -> 'winners') z)) then
+          raise exception 'hand % does not add up: %', v_hand, st -> 'result';
+        end if;
+        if (st -> 'result' ->> 'showdown')::boolean then
+          v_showdowns := v_showdowns + 1;
+          if jsonb_array_length(st -> 'result' -> 'pots') > 1 then v_side := v_side + 1; end if;
+          if exists (select 1 from jsonb_array_elements(st -> 'result' -> 'pots') q where jsonb_array_length(q -> 'winners') > 1) then v_splits := v_splits + 1; end if;
+          if exists (select 1 from jsonb_array_elements(st -> 'seats') q where q <> 'null' and (q ->> 'inHand')::boolean and not (q ->> 'folded')::boolean and q -> 'cards' = 'null') then
+            v_mucks := v_mucks + 1;
+          end if;
+        end if;
+        perform pg_temp.pk_as(7);
+        perform pg_temp.pk_no_leak(t, public.poker_state(t), '{}', 'a spectator''s view of a finished hand');
+        perform pg_temp.pk_no_leak(t, public.poker_proof(t), '{}', 'the fairness record of a finished hand');
+      end if;
+      -- Between hands players come and go, sit out, come back and add chips.
+      for v_n in 1..6 loop
+        w := pg_temp.pk_where(v_n);
+        v_cash := pg_temp.pk_cash(v_n);
+        x := random();
+        r := null;
+        perform pg_temp.pk_as(v_n);
+        if w is null then
+          if x < 0.6 and v_cash >= 300 then r := public.poker_sit(t, trunc(least(v_cash, 300 + floor(random() * 4000)::numeric))); end if;
+        elsif (w ->> 'leaving')::boolean then null;
+        elsif (w ->> 'stack')::bigint = 0 then
+          if x < 0.7 and v_cash >= 300 then r := public.poker_buy(t, trunc(least(v_cash, 300 + floor(random() * 3000)::numeric))); else r := public.poker_leave(t); end if;
+        elsif (w ->> 'sitting_out')::boolean then
+          if x < 0.7 then r := public.poker_away(t, false); end if;
+        elsif x < 0.03 then r := public.poker_leave(t);
+        elsif x < 0.06 then r := public.poker_away(t, true);
+        elsif x < 0.10 and v_cash >= 100 then r := public.poker_buy(t, 100);
+        else r := public.poker_state(t);
+        end if;
+        if r ? 'error' then raise exception 'player % was refused between hands: % (%)', v_n, r ->> 'error', w; end if;
+      end loop;
+      perform pg_temp.pk_age(t, 12);
+      perform pg_temp.pk_as(7);
+      perform public.poker_tick(t);
+    else
+      act := st -> 'act';
+      v_seat := (act ->> 'seat')::int;
+      if v_seat is null or pg_temp.pk_user(t, v_seat) is null then raise exception 'a live hand with nobody to act at step %: % / %', v_step, st, pg_temp.pk_hand(t) - 'deck' - 'salts' - 'commits'; end if;
+      x := random();
+      if x < 0.03 then
+        -- The player to act has gone: the clock plays for them.
+        perform pg_temp.pk_age(t, 27);
+        perform pg_temp.pk_as(7);
+        perform public.poker_tick(t);
+        v_timeouts := v_timeouts + 1;
+      elsif x < 0.05 then
+        -- Someone leaves in the middle of the hand, whether or not it is their turn.
+        v_n := 1 + floor(random() * 6)::int;
+        w := pg_temp.pk_where(v_n);
+        if w is not null and not (w ->> 'leaving')::boolean then
+          perform pg_temp.pk_as(v_n);
+          r := public.poker_leave(t);
+          if r ? 'error' then raise exception 'player % could not leave mid-hand: %', v_n, r ->> 'error'; end if;
+          v_leaves := v_leaves + 1;
+        end if;
+      else
+        v_call := (act ->> 'toCall')::bigint;
+        v_can := (act ->> 'canRaise')::boolean;
+        v_min := (act ->> 'minRaise')::bigint;
+        v_max := (act ->> 'maxRaise')::bigint;
+        x := random();
+        v_move := case
+          when not v_can and v_call = 0 then case when x < 0.03 then 'fold' else 'check' end
+          when not v_can then case when x < 0.3 then 'fold' else 'call' end
+          when v_call = 0 then case when x < 0.02 then 'fold' when x < 0.6 then 'check' when x < 0.93 then 'raise' else 'allin' end
+          else case when x < 0.22 then 'fold' when x < 0.72 then 'call' when x < 0.93 then 'raise' else 'allin' end end;
+        if v_move in ('raise', 'allin') then
+          v_amt := case when v_move = 'allin' then v_max else least(v_max, v_min + floor(random() * 3 * v_min)::bigint) end;
+          if v_amt = v_max then v_allins := v_allins + 1; end if;
+          r := pg_temp.pk_move(t, v_seat, case when (st ->> 'bet')::bigint = 0 then 'bet' else 'raise' end, v_amt);
+        else
+          r := pg_temp.pk_move(t, v_seat, v_move);
+        end if;
+        if r ? 'error' then raise exception 'seat % could not % (%): % in %', v_seat, v_move, v_amt, r ->> 'error', st; end if;
+        v_moves := v_moves + 1;
+        perform pg_temp.pk_no_leak(t, r, pg_temp.pk_hole_at(t, v_seat), 'the answer to a move');
+      end if;
+      if v_step % 5 = 0 then
+        perform pg_temp.pk_no_leak(t, to_jsonb((select tt from (select id, version, hand_no, deadline, state from public.poker_tables where id = t) tt)), '{}', 'the public row');
+        perform pg_temp.pk_as(7);
+        perform pg_temp.pk_no_leak(t, public.poker_state(t), '{}', 'a spectator''s view');
+        v_n := 1 + floor(random() * 6)::int;
+        perform pg_temp.pk_as(v_n);
+        perform pg_temp.pk_no_leak(t, public.poker_state(t), pg_temp.pk_hole(t, v_n), 'a player''s view');
+      end if;
+    end if;
+    if pg_temp.pk_chips() <> v_total then raise exception 'chips changed from % to % at step % (hand %): %', v_total, pg_temp.pk_chips(), v_step, st ->> 'hand', st; end if;
+  end loop;
+  update pk_sim set hands = v_hand, moves = moves + v_moves, allins = allins + v_allins, timeouts = timeouts + v_timeouts, leaves = leaves + v_leaves,
+    showdowns = showdowns + v_showdowns, side = side + v_side, splits = splits + v_splits, mucks = mucks + v_mucks;
+end $$;
+set role authenticated;
+select setseed(0.2026);
+select pg_temp.pk_chips() as sim_total, pg_temp.pk_table() as sim_table \gset
+select format('select pg_temp.pk_sim(%s, 10)', :sim_table) from generate_series(1, 201) \gexec
+select pg_temp.pk_close(:sim_table);
+select pg_temp.ok(pg_temp.pk_chips() = :sim_total, format('%s random hands (%s moves, %s all-ins, %s timeouts, %s players leaving mid-hand): cash, stacks and pots add up to the same total after every step',
+  hands, moves, allins, timeouts, leaves)) from pk_sim;
+select pg_temp.ok(hands >= 2000 and showdowns > 300 and side > 50 and splits > 0 and mucks > 20 and timeouts > 100 and leaves > 50 and allins > 500,
+  format('the hands covered %s showdowns, %s with side pots, %s split pots and %s with a mucked hand; none sent a hidden card to anyone', showdowns, side, splits, mucks)) from pk_sim;
+reset role;
+select pg_temp.ok(pg_temp.pk_chips() = :pk_total, 'after every table test the chips still add up to what the players started with');
+select pg_temp.ok((select sum(net) = 0 and sum(staked) = sum(returned) and count(*) > 5000 from public.game_rounds where game = 'poker'),
+  'the recorded results of every hand sum to zero: no rake, nothing created');
+select pg_temp.ok(not exists (
+  select 1 from (select user_id, game, count(*) n, sum(staked) w, sum(net) net, max(net) best from public.game_rounds where game = 'poker' group by 1, 2) g
+  full join (select user_id, game, sum(rounds) n, sum(wagered) w, sum(net) net, max(best) best from private.game_totals where game = 'poker' group by 1, 2) x using (user_id, game)
+  where g.n is distinct from x.n or g.w is distinct from x.w or g.net is distinct from x.net or g.best is distinct from x.best),
+  'leaderboard totals match the hands recorded');
+select pg_temp.ok((select count(*) from private.poker_seats) = 0 and (select count(*) from public.poker_tables where stake = 'test') = 0, 'no seat or test table is left behind');
+
+-- A balance reset or a deleted account can't carry chips over or leave a hand stuck.
+-- (The simulation left some players broke, so everyone starts these with a fresh $100,000.)
+update public.portfolios set cash = 100000 where user_id in (select pg_temp.u(n) from generate_series(1, 7) n);
+set role authenticated;
+do $$
+declare t bigint := pg_temp.pk_setup(array[2000, 2000, 2000]); st jsonb; r jsonb; v_seat int; v_other int;
+begin
+  perform pg_temp.pk_deal(t, 0);
+  perform pg_temp.pk_as(1);
+  r := public.reset_balance();
+  st := pg_temp.pk_state(t);
+  perform pg_temp.ok((r ->> 'cash')::numeric = 50000 and (r ->> 'tableChips')::numeric = 0 and (st -> 'seats' -> 0 ->> 'folded')::boolean
+    and (st -> 'seats' -> 0 ->> 'left')::boolean and (st -> 'act' ->> 'seat')::int = 1 and public.poker_lobby() -> 'seat' = 'null',
+    'a balance reset mid-hand folds the player and takes them off the table; the turn passes on');
+  st := pg_temp.pk_do(t, 1, 'fold');
+  st := pg_temp.pk_tick(t, 10);
+  perform pg_temp.ok(st -> 'seats' -> 0 = 'null' and pg_temp.pk_cash(1) = 50000 and pg_temp.stacks(st) = array[-1, 1900, 1950, -1, -1, -1] and st ->> 'phase' = 'preflop',
+    'the chips they had at the table end with the old run: the new one starts at exactly $50,000');
+  -- The player to act deletes their account.
+  v_seat := (st -> 'act' ->> 'seat')::int;
+  v_other := 3 - v_seat;
+  perform set_config('request.jwt.claim.sub', pg_temp.pk_user(t, v_seat)::text, false);
+  perform pg_temp.ok((public.delete_account('DELETE') ->> 'deleted')::boolean, 'an account can be deleted in the middle of a hand');
+  st := pg_temp.pk_state(t);
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and (st -> 'seats' -> v_seat ->> 'left')::boolean and (st -> 'seats' -> v_other ->> 'won')::int > 0
+    and pg_temp.pk_user(t, v_seat) is null, 'the hand ends in the other player''s favour instead of hanging');
+  st := pg_temp.pk_tick(t, 10);
+  perform pg_temp.ok(st -> 'seats' -> v_seat = 'null' and st ->> 'phase' = 'waiting' and st -> 'seats' -> v_other ->> 'name' is not null, 'and the empty seat is cleared');
+  perform pg_temp.pk_close(t);
+  -- All-in, then a reset, then the hand is won: the pot is not paid into the new run.
+  t := pg_temp.pk_table();
+  perform pg_temp.pk_sit(t, 4, 500, 0);
+  perform pg_temp.pk_sit(t, 5, 2000, 1);
+  perform pg_temp.pk_deal(t, 0, '{"0": ["As", "Ad"], "1": ["7c", "2d"]}', array['3h', '8c', '9d', 'Jh', '4s']);
+  st := pg_temp.pk_do(t, 0, 'raise', 500);
+  perform pg_temp.pk_as(4);
+  r := public.reset_balance();
+  st := pg_temp.pk_do(t, 1, 'call');
+  perform pg_temp.ok((st -> 'seats' -> 0 ->> 'won')::int = 1000, 'an all-in player who resets is still in for the pot');
+  st := pg_temp.pk_tick(t, 12);
+  perform pg_temp.ok(st -> 'seats' -> 0 = 'null' and pg_temp.pk_cash(4) = 50000, 'but winning it adds nothing to the new run');
+  perform pg_temp.pk_close(t);
+end $$;
+reset role;
+select pg_temp.ok((select count(*) from private.poker_seats) = 0 and not exists (select 1 from public.poker_tables where stake = 'test'), 'the tables are empty again');
+
 \echo 'all database tests passed'
