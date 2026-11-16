@@ -2971,7 +2971,8 @@ begin
   end if;
 
   -- Each player's result for the hand goes to their history and the leaderboard totals; wins also go to the feed.
-  for s in select * from private.poker_seats where table_id = p_table and in_hand and committed > 0 and user_id is not null and run >= 0 loop
+  -- (A player can win without having put a chip in, when the blinds both leave before the first move.)
+  for s in select * from private.poker_seats where table_id = p_table and in_hand and (committed > 0 or won > 0) and user_id is not null and run >= 0 loop
     v_detail := case
       when s.won > 0 and v_showdown then 'Won with ' || private.poker_rank_name(s.hand_rank)
       when s.won > 0 then 'Won, everyone else folded'

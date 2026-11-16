@@ -1368,6 +1368,23 @@ begin
   perform pg_temp.ok(st -> 'seats' -> 1 = 'null' and pg_temp.pk_cash(2) = c2 + 500, 'which goes to their cash when the seat is freed');
   perform pg_temp.pk_close(t);
 end $$;
+-- Both blinds leave before the first player has acted: that player wins the blinds without putting a chip in, and it is recorded.
+do $$
+declare t bigint := pg_temp.pk_setup(array[1000, 1000, 1000]); st jsonb; r jsonb;
+begin
+  perform pg_temp.pk_deal(t, 0);
+  perform pg_temp.pk_as(2);
+  r := public.poker_leave(t);
+  perform pg_temp.pk_as(3);
+  r := public.poker_leave(t);
+  st := r -> 'table' -> 'state';
+  perform pg_temp.ok(st ->> 'phase' = 'showdown' and pg_temp.stacks(st) = array[1100, 0, 0, -1, -1, -1]
+    and st -> 'result' -> 'players' = '[{"net": 100, "won": 100, "seat": 0}, {"net": -50, "won": 0, "seat": 1}, {"net": -50, "won": 0, "seat": 2}]',
+    'when both blinds leave, the player still to act wins them (the big blind gets its unmatched half back)');
+  perform pg_temp.ok((pg_temp.pk_round(1) ->> 'staked')::numeric = 0 and (pg_temp.pk_round(1) ->> 'net')::numeric = 100
+    and pg_temp.pk_round(1) ->> 'detail' like 'Won, everyone else folded%', 'a win with no chips put in is still recorded');
+  perform pg_temp.pk_close(t);
+end $$;
 reset role;
 select pg_temp.ok(pg_temp.pk_chips() = :pk_total, 'timeouts, leaving and joining balance to the chip');
 
