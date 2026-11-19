@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { sha256Hex } from './fair.js'
-import { betPresets, CODE_ALPHABET, compareRanks, formatChips, formatCode, isCodeShape, normalizeCode, tableLink, handLabel, handRank, initials, isCard, potRaiseTo, potSummary, rankLabel, secondsLeft, toCard, verifyProof, viewPosition } from './poker.js'
+import { betPresets, buyInBounds, buyInProblem, CODE_ALPHABET, compareRanks, formatChips, formatCode, isCodeShape, niceStep, normalizeCode, tableLink, handLabel, handRank, initials, isCard, potRaiseTo, potSummary, rankLabel, secondsLeft, toCard, verifyProof, viewPosition } from './poker.js'
 
 const rank = (text) => handRank(text.split(' '))
 
@@ -198,5 +198,36 @@ describe('private table codes', () => {
   it('makes a link a friend can open', () => {
     expect(tableLink('https://example.test', 12, 'abc-d23')).toBe('https://example.test/#/games/tables/12?code=ABCD23')
     expect(tableLink('https://example.test', 7)).toBe('https://example.test/#/games/tables/7')
+  })
+})
+
+describe('custom buy-ins for a private table', () => {
+  it('allows 10 to 1,000 big blinds, up to $1,000,000', () => {
+    expect(buyInBounds(2)).toEqual({ min: 20, max: 2000 })
+    expect(buyInBounds(10)).toEqual({ min: 100, max: 10000 })
+    expect(buyInBounds(200)).toEqual({ min: 2000, max: 200000 })
+    expect(buyInBounds(5000)).toEqual({ min: 50000, max: 1000000 })
+  })
+  it('accepts a range inside the bounds, edges included', () => {
+    expect(buyInProblem({ min: 100, max: 10000 }, 10)).toBeNull()
+    expect(buyInProblem({ min: 500, max: 500 }, 10)).toBeNull()
+    expect(buyInProblem({ min: 1000, max: 2500 }, 10)).toBeNull()
+  })
+  it('explains what is wrong, in the server’s words', () => {
+    expect(buyInProblem({ min: 99, max: 1000 }, 10)).toBe('The smallest buy-in at these blinds is $100 (10 big blinds).')
+    expect(buyInProblem({ min: 500, max: 400 }, 10)).toBe('The largest buy-in can’t be below the smallest.')
+    expect(buyInProblem({ min: 100, max: 10001 }, 10)).toBe('The largest buy-in at these blinds is $10,000.')
+    expect(buyInProblem({ min: 100.5, max: 900 }, 10)).toBe('Buy-ins are whole dollars.')
+    expect(buyInProblem({ min: NaN, max: 900 }, 10)).toBe('Buy-ins are whole dollars.')
+    expect(buyInProblem({ min: 0, max: 900 }, 10)).toBe('Buy-ins are whole dollars.')
+  })
+  it('picks a round slider step with at most 200 stops', () => {
+    expect(niceStep(20, 220)).toBe(1)
+    expect(niceStep(100, 500)).toBe(5)
+    expect(niceStep(500, 2500)).toBe(10)
+    expect(niceStep(2500, 12500)).toBe(50)
+    expect(niceStep(10000, 50000)).toBe(250)
+    expect(niceStep(0, 50_000_000)).toBe(50000)
+    expect(niceStep(5, 5)).toBe(1)
   })
 })

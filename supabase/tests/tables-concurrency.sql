@@ -42,7 +42,7 @@ begin
   end if;
   v_seated := exists (select 1 from jsonb_array_elements(st -> 'seats') q where q ->> 'name' = 'race_' || chr(96 + p_player));
   if not v_seated then
-    if x < 0.7 then perform public.poker_sit(t, (200 + floor(random() * 800))::numeric); else perform public.poker_state(t); end if;
+    if x < 0.7 then perform public.poker_sit(t, (500 + floor(random() * 2000))::numeric); else perform public.poker_state(t); end if;
   elsif x < 0.04 then perform public.poker_leave(t);
   elsif x < 0.07 then perform public.poker_away(t, random() < 0.5);
   elsif x < 0.12 then perform public.poker_buy(t, 100);

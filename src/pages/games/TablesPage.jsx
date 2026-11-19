@@ -35,10 +35,11 @@ function Rules() {
         five cards out of seven win the pot. There is no house cut: every chip lost is won by another player.
       </p>
       <ul className="list-disc space-y-1 pl-5">
-        <li>You buy in for 20 to 100 big blinds from your available funds. The chips come back when you leave the table.</li>
+        <li>You buy in from your available funds, 50 to 250 big blinds at the public tables. The chips come back when you leave the table.</li>
         <li>
           To play with friends, open a private table: it gets a six-character code to share. Only people who have the code can see it or sit down, it stays
-          out of the lobby, and an empty one closes after half an hour. You can have three open at a time.
+          out of the lobby, and an empty one closes after half an hour. You can have three open at a time. You choose the blinds and the buy-in range for
+          your table: from 10 to 1,000 big blinds, typed or set with the sliders.
         </li>
         <li>The two players after the dealer button post the blinds. Heads-up, the button posts the small blind and acts first before the flop.</li>
         <li>On your turn you fold, check or call, or bet or raise. A raise adds at least the last bet or raise; you can always go all-in for less.</li>
@@ -158,7 +159,7 @@ function Lobby() {
         working={working}
         createError={createError}
         joinError={joinError}
-        onCreate={(stake) => open(() => pokerCreate(stake), setCreateError)}
+        onCreate={(stake, buyIn) => open(() => pokerCreate({ stake, minBuy: buyIn.min, maxBuy: buyIn.max }), setCreateError)}
         onJoin={(code) => open(() => pokerJoin(code), setJoinError)}
         onOpen={(t) => navigate(tablePath(t.id, t.code))}
       />

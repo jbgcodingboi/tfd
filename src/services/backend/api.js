@@ -292,8 +292,8 @@ export const pokerLobby = () => rpc('poker_lobby')
 export const pokerState = (table, code) => rpc('poker_state', { p_table: table, p_code: code ?? null })
 export const pokerTick = (table) => rpc('poker_tick', { p_table: table })
 export const pokerSit = ({ table, buyIn, seat, code }) => rpc('poker_sit', { p_table: table, p_buy_in: buyIn, p_seat: seat ?? null, p_code: code ?? null })
-/** Opens a private table at a stake: answers { table, code } or { error }. */
-export const pokerCreate = (stake) => rpc('poker_create', { p_stake: stake })
+/** Opens a private table at a stake, with its own buy-in range if given: answers { table, code } or { error }. */
+export const pokerCreate = ({ stake, minBuy, maxBuy }) => rpc('poker_create', { p_stake: stake, p_min_buy: minBuy ?? null, p_max_buy: maxBuy ?? null })
 /** Looks a private table up by its code: answers { table, code } or { error }. */
 export const pokerJoin = (code) => rpc('poker_join', { p_code: code })
 export const pokerLeave = (table) => rpc('poker_leave', { p_table: table })

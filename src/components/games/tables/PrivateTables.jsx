@@ -1,5 +1,5 @@
 import { useId, useState } from 'react'
-import { formatChips, formatCode, isCodeShape, normalizeCode, tableLink } from '../../../games/poker.js'
+import { buyInBounds, buyInProblem, formatChips, formatCode, isCodeShape, niceStep, normalizeCode, tableLink } from '../../../games/poker.js'
 import { copyText } from './copyText.js'
 
 /** A box to type a join code into. `onSubmit` gets the normalized code; the caller shows what the server answers. */
@@ -65,6 +65,47 @@ export function ShareCode({ tableId, code, compact = false }) {
   )
 }
 
+/** One end of the buy-in range: a typed amount and a slider that stay in step. */
+function AmountField({ label, value, onChange, lo, hi }) {
+  const id = useId()
+  const n = Number(value)
+  const step = niceStep(lo, hi)
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-3">
+        <label htmlFor={id} className="text-xs font-medium text-muted">
+          {label}
+        </label>
+        <span className="relative">
+          <span className="pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2 text-sm text-muted">$</span>
+          <input
+            id={id}
+            type="number"
+            inputMode="numeric"
+            min={lo}
+            max={hi}
+            step={1}
+            className="input h-9 w-32 py-1 pl-6 text-right tabular"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+          />
+        </span>
+      </div>
+      <input
+        type="range"
+        className="tb-range"
+        min={lo}
+        max={hi}
+        step={step}
+        value={Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : lo}
+        onChange={(e) => onChange(e.target.value)}
+        aria-label={`${label} slider`}
+        aria-valuetext={formatChips(n)}
+      />
+    </div>
+  )
+}
+
 /**
  * Play with friends: open a private table at a stake (it gets a code to share),
  * or type a code to find one. The lobby passes the stakes and the private
@@ -72,8 +113,18 @@ export function ShareCode({ tableId, code, compact = false }) {
  */
 export default function PrivateTables({ lobby, working, createError, joinError, onCreate, onJoin, onOpen }) {
   const [stake, setStake] = useState(null)
+  // The buy-in being typed or dragged, for the stake it was set at (switching stake goes back to that stake's standard range).
+  const [edit, setEdit] = useState(null)
   const stakes = lobby.stakes ?? []
   const chosen = stakes.find((s) => s.stake === stake) ?? stakes[1] ?? stakes[0]
+  const typed = edit && edit.stake === chosen?.stake ? edit : null
+  const minText = typed?.min ?? String(chosen?.minBuy ?? '')
+  const maxText = typed?.max ?? String(chosen?.maxBuy ?? '')
+  const range = { min: Number(minText), max: Number(maxText) }
+  const bounds = chosen ? buyInBounds(chosen.bigBlind) : { min: 0, max: 0 }
+  const problem = chosen && (minText === '' || maxText === '') ? 'Enter both buy-ins.' : chosen ? buyInProblem(range, chosen.bigBlind) : null
+  const standard = !typed || (minText === String(chosen?.minBuy) && maxText === String(chosen?.maxBuy))
+  const setBuyIn = (patch) => setEdit({ stake: chosen.stake, min: minText, max: maxText, ...patch })
   return (
     <section className="card space-y-4 p-4" aria-labelledby="friends-heading">
       <div>
@@ -106,11 +157,43 @@ export default function PrivateTables({ lobby, working, createError, joinError, 
                 ))}
               </div>
               {chosen && (
-                <p className="text-xs text-subtle tabular">
-                  Buy-in {formatChips(chosen.minBuy)} to {formatChips(chosen.maxBuy)}
-                </p>
+                <fieldset className="space-y-1 rounded-xl border border-line p-3">
+                  <legend className="px-1 text-xs font-medium text-muted">Buy-in range</legend>
+                  <AmountField
+                    label="Smallest buy-in"
+                    value={minText}
+                    onChange={(v) => setBuyIn({ min: v })}
+                    lo={bounds.min}
+                    hi={Math.max(bounds.min, Math.min(bounds.max, Number(maxText) || bounds.max))}
+                  />
+                  <AmountField
+                    label="Largest buy-in"
+                    value={maxText}
+                    onChange={(v) => setBuyIn({ max: v })}
+                    lo={Math.min(bounds.max, Math.max(bounds.min, Number(minText) || bounds.min))}
+                    hi={bounds.max}
+                  />
+                  <div className="flex items-center justify-between gap-2 text-xs text-subtle">
+                    <span>{standard ? 'Standard range for these blinds.' : 'Custom range.'}</span>
+                    {!standard && (
+                      <button type="button" className="font-semibold text-primary-300 hover:underline" onClick={() => setEdit(null)}>
+                        Use standard
+                      </button>
+                    )}
+                  </div>
+                  {problem && (
+                    <p className="text-sm text-no" role="alert">
+                      {problem}
+                    </p>
+                  )}
+                </fieldset>
               )}
-              <button type="button" className="btn btn-primary h-11 w-full" disabled={working || !chosen} onClick={() => onCreate(chosen.stake)}>
+              <button
+                type="button"
+                className="btn btn-primary h-11 w-full"
+                disabled={working || !chosen || Boolean(problem)}
+                onClick={() => onCreate(chosen.stake, standard ? {} : range)}
+              >
                 {working ? 'Opening…' : 'Create table'}
               </button>
               {createError && (
@@ -133,6 +216,7 @@ export default function PrivateTables({ lobby, working, createError, joinError, 
               <li key={t.id} className="flex flex-wrap items-center justify-between gap-2 py-2">
                 <span className="tabular">
                   ${t.smallBlind}/${t.bigBlind} · {t.seated}/{t.seats} seated
+                  {t.minBuy ? <span className="block text-xs text-subtle">Buy-in {formatChips(t.minBuy)} to {formatChips(t.maxBuy)}</span> : null}
                 </span>
                 <span className="flex flex-wrap items-center gap-2">
                   <ShareCode tableId={t.id} code={t.code} compact />
