@@ -288,14 +288,19 @@ export const playSlots = ({ amount }) => rpc('play_slots', { p_amount: amount })
 // Every call answers with the caller's view of the table; a refusal comes back as { error } alongside it.
 
 export const pokerLobby = () => rpc('poker_lobby')
-export const pokerState = (table) => rpc('poker_state', { p_table: table })
+/** A private table also needs its join code (unless the player is already seated at it). */
+export const pokerState = (table, code) => rpc('poker_state', { p_table: table, p_code: code ?? null })
 export const pokerTick = (table) => rpc('poker_tick', { p_table: table })
-export const pokerSit = ({ table, buyIn, seat }) => rpc('poker_sit', { p_table: table, p_buy_in: buyIn, p_seat: seat ?? null })
+export const pokerSit = ({ table, buyIn, seat, code }) => rpc('poker_sit', { p_table: table, p_buy_in: buyIn, p_seat: seat ?? null, p_code: code ?? null })
+/** Opens a private table at a stake: answers { table, code } or { error }. */
+export const pokerCreate = (stake) => rpc('poker_create', { p_stake: stake })
+/** Looks a private table up by its code: answers { table, code } or { error }. */
+export const pokerJoin = (code) => rpc('poker_join', { p_code: code })
 export const pokerLeave = (table) => rpc('poker_leave', { p_table: table })
 export const pokerAct = ({ table, action, amount, turn }) => rpc('poker_act', { p_table: table, p_action: action, p_amount: amount ?? null, p_turn: turn ?? null })
 export const pokerAway = ({ table, away }) => rpc('poker_away', { p_table: table, p_away: away })
 export const pokerBuy = ({ table, amount }) => rpc('poker_buy', { p_table: table, p_amount: amount })
-export const pokerProof = (table) => rpc('poker_proof', { p_table: table })
+export const pokerProof = (table, code) => rpc('poker_proof', { p_table: table, p_code: code ?? null })
 
 /**
  * Follows one table live: calls back with each new public row (version and

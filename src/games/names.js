@@ -12,8 +12,8 @@ export const GAME_NAME = {
   // Retired; past rounds keep their name.
   boneyard: 'Boneyard',
   slots: 'Golden Sevens',
-  // The card game between players goes by a plain name too.
-  poker: 'Tables',
+  // The card game between players. Its address stays short: #/games/tables.
+  poker: "Texas Hold'em",
 }
 
 /**
