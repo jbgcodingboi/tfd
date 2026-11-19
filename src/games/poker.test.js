@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { sha256Hex } from './fair.js'
-import { betPresets, compareRanks, formatChips, handLabel, handRank, initials, isCard, potRaiseTo, potSummary, rankLabel, secondsLeft, toCard, verifyProof, viewPosition } from './poker.js'
+import { betPresets, CODE_ALPHABET, compareRanks, formatChips, formatCode, isCodeShape, normalizeCode, tableLink, handLabel, handRank, initials, isCard, potRaiseTo, potSummary, rankLabel, secondsLeft, toCard, verifyProof, viewPosition } from './poker.js'
 
 const rank = (text) => handRank(text.split(' '))
 
@@ -167,5 +167,36 @@ describe('fairness check', () => {
     expect((await verifyProof(resealed)).ok).toBe(false)
     expect((await verifyProof(proof, 'f'.repeat(64))).problems).toEqual(['This record is for a different deck than the one shown during the hand.'])
     expect((await verifyProof({ deckHash: 'x', commits: [], reveals: [] })).ok).toBe(false)
+  })
+})
+
+describe('private table codes', () => {
+  it('has no look-alike characters in its alphabet', () => {
+    expect(CODE_ALPHABET).toHaveLength(32)
+    for (const c of '01OI') expect(CODE_ALPHABET).not.toContain(c)
+    expect(new Set(CODE_ALPHABET).size).toBe(32)
+  })
+  it('reads a code however it was typed', () => {
+    expect(normalizeCode(' abc-d2e ')).toBe('ABCD2E')
+    expect(normalizeCode('ab cd ef')).toBe('ABCDEF')
+    expect(normalizeCode(null)).toBe('')
+    expect(normalizeCode('ab_c.d!e#f')).toBe('ABCDEF')
+  })
+  it('knows the shape of a real code', () => {
+    expect(isCodeShape('ABCD23')).toBe(true)
+    expect(isCodeShape('ABCD2')).toBe(false)
+    expect(isCodeShape('ABCD234')).toBe(false)
+    expect(isCodeShape('ABCD20')).toBe(false)
+    expect(isCodeShape('ABCDOI')).toBe(false)
+    expect(isCodeShape('')).toBe(false)
+  })
+  it('shows a code in two halves for reading aloud', () => {
+    expect(formatCode('ABCD23')).toBe('ABC-D23')
+    expect(formatCode('SHORT')).toBe('SHORT')
+    expect(formatCode(null)).toBe('')
+  })
+  it('makes a link a friend can open', () => {
+    expect(tableLink('https://example.test', 12, 'abc-d23')).toBe('https://example.test/#/games/tables/12?code=ABCD23')
+    expect(tableLink('https://example.test', 7)).toBe('https://example.test/#/games/tables/7')
   })
 })

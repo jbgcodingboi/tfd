@@ -56,7 +56,7 @@ Requires Node 20.19+ (Node 22 recommended).
   board is kept in the URL (`#/leaderboard?board=games`).
 - **Guest mode**: everything is browsable without an account; trading, the portfolio and resets need one.
 - **Games**: Roulette, Blackjack, Plinko, Dice, Mines, Chicken Cross, Limbo (with Crash) and the Golden Sevens slot,
-  played with your portfolio cash (see below). With the backend there is also **Tables**, live hold'em between players.
+  played with your portfolio cash (see below). With the backend there is also **Texas Hold'em**, live between players.
 
 ## How the paper trading math works
 
@@ -205,12 +205,14 @@ sampling, so outcomes are unbiased.
   by one, payline highlights, Big/Mega/Epic win celebrations, turbo spins, autoplay and Space to spin. It replaced
   Boneyard, whose past rounds stay in players' history.
 
-- **Tables** (backend mode only, since it needs other players): live No-Limit Texas Hold'em at shared tables of
+- **Texas Hold'em** (backend mode only, since it needs other players; its address is `#/games/tables`): live No-Limit Hold'em at shared tables of
   two to six, at four fixed stakes ($1/$2, $5/$10, $25/$50, $100/$200). A buy-in of 20 to 100 big blinds moves
   from cash to a table stack and comes back when you leave. There is no rake: every hand's results sum to zero.
   The database runs the whole game (shuffle, deal, every move, side pots, hand ranking, payouts); the browser only
   sends fold, check, call, bet, raise, sit and leave, and draws what comes back. Each player has 25 seconds to
-  act; out of time they are checked or folded, and after two timeouts sat out. Guests can watch but not sit (see
+  act; out of time they are checked or folded, and after two timeouts sat out. **Private tables**: a signed-up
+  player can open one at any stake (three at a time); it gets a six-character code to share, stays out of the lobby,
+  and only people holding the code (or already seated) can see it, watch or sit. An empty one closes after half an hour. Guests can watch but not sit (see
   [Tables](#tables)). The full rule set is the comment at the top of the poker section of `supabase/schema.sql`.
 
 Dice, Limbo, Golden Sevens, Mines and Chicken Cross have **auto play**: a number of bets, raising the bet by a percentage after a win or a
@@ -220,7 +222,7 @@ which can be muted.
 
 Game pages have short addresses: `#/games/spin` (Roulette), `21` (Blackjack), `balls` (Plinko), `roll` (Dice),
 `gems` (Mines), `cross` (Chicken Cross), `target` (Limbo), `rocket` (Crash), `reels` (Golden Sevens) and `tables`
-(the card game between players, shown as **Tables**), set in
+(the card game between players, shown as **Texas Hold'em**), set in
 `src/games/names.js`. The old addresses named after each game still work and redirect. Game pages share one
 tab title, "Games · Chami Market", and Roulette and Blackjack are shown as **Spin** and **21**.
 

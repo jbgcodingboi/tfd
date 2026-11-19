@@ -721,6 +721,7 @@ insert into auth.users (email, raw_user_meta_data) values
   ('pseven@users.test', '{"username":"pseven"}');
 insert into auth.users (email, is_anonymous) values (null, true);
 select id as pkguest from auth.users where is_anonymous order by created_at desc, id limit 1 \gset
+select set_config('test.pkguest', :'pkguest', false);
 
 -- Test players by number, and peeks at what the client roles can't reach.
 create or replace function pg_temp.u(n int) returns uuid language sql security definer as $$
@@ -810,6 +811,14 @@ begin
   perform pg_temp.pk_as(p_n);
   r := public.poker_sit(p_table, p_buy, p_seat);
   if r ? 'error' then raise exception 'player % could not sit: %', p_n, r ->> 'error'; end if;
+  return r;
+end $$;
+create or replace function pg_temp.pk_sit_code(p_table bigint, p_n int, p_buy numeric, p_code text) returns jsonb language plpgsql as $$
+declare r jsonb;
+begin
+  perform pg_temp.pk_as(p_n);
+  r := public.poker_sit(p_table, p_buy, null, p_code);
+  if r ? 'error' then raise exception 'player % could not sit with the code: %', p_n, r ->> 'error'; end if;
   return r;
 end $$;
 -- A new test table with players 1..n in seats 0..n-1 holding the given stacks.
@@ -1692,6 +1701,100 @@ select pg_temp.ok(not exists (
   where g.n is distinct from x.n or g.w is distinct from x.w or g.net is distinct from x.net or g.best is distinct from x.best),
   'leaderboard totals match the hands recorded');
 select pg_temp.ok((select count(*) from private.poker_seats) = 0 and (select count(*) from public.poker_tables where stake = 'test') = 0, 'no seat or test table is left behind');
+
+-- Private tables: a code for friends --------------------------------------------------
+-- (The simulation left some players broke, so everyone starts these with a fresh $100,000.)
+reset role;
+update public.portfolios set cash = 100000 where user_id in (select pg_temp.u(n) from generate_series(1, 7) n);
+set role authenticated;
+do $$
+declare r jsonb; t bigint; v_code text; lobby jsonb; st jsonb; v_cash numeric := pg_temp.pk_cash(4) + pg_temp.pk_cash(5); i int;
+begin
+  perform pg_temp.pk_as(4);
+  perform pg_temp.ok(public.poker_create('giant') ->> 'error' like '%listed stakes%' and public.poker_create(null) ->> 'error' like '%listed stakes%', 'a private table uses one of the fixed stakes');
+  r := public.poker_create('low');
+  t := (r ->> 'table')::bigint;
+  v_code := r ->> 'code';
+  perform pg_temp.ok(v_code ~ '^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$' and t is not null, 'opening a private table gives a six-character code with no look-alike letters');
+  lobby := public.poker_lobby();
+  perform pg_temp.ok(not exists (select 1 from jsonb_array_elements(lobby -> 'tables') x where (x ->> 'id')::bigint = t)
+    and lobby -> 'mine' -> 0 ->> 'code' = v_code and (lobby -> 'mine' -> 0 ->> 'id')::bigint = t and jsonb_array_length(lobby -> 'stakes') = 4,
+    'it is left out of the lobby, and its creator can find the code again');
+  st := public.poker_state(t, v_code) -> 'table';
+  perform pg_temp.ok((st ->> 'private')::boolean and st ->> 'code' = v_code and (st ->> 'smallBlind')::int = 5 and (st ->> 'minBuy')::int = 200, 'the code opens the table at the chosen stake');
+  perform pg_temp.ok(public.poker_state(t) -> 'table' ->> 'code' = v_code and public.poker_visible(t), 'the player who opened it gets in without the code');
+
+  -- Someone without the code learns nothing and can do nothing.
+  perform pg_temp.pk_as(5);
+  perform pg_temp.ok(public.poker_state(t) = '{"error": "This is a private table. Enter its code to join.", "private": true}'
+    and public.poker_state(t, 'AAAAAA') ->> 'private' = 'true' and public.poker_sit(t, 500) ->> 'private' = 'true' and public.poker_sit(t, 500, 0, 'ZZZZZZ') ->> 'private' = 'true'
+    and public.poker_leave(t) ->> 'private' = 'true' and public.poker_act(t, 'fold') ->> 'private' = 'true' and public.poker_away(t, true) ->> 'private' = 'true'
+    and public.poker_buy(t, 100) ->> 'private' = 'true' and public.poker_proof(t) ->> 'private' = 'true' and public.poker_tick(t) ->> 'private' = 'true'
+    and not public.poker_state(t) ? 'table', 'without the code every call is refused and nothing about the table comes back');
+  perform pg_temp.ok((select count(*) from public.poker_tables where id = t) = 0 and not public.poker_visible(t)
+    and not exists (select 1 from jsonb_array_elements(public.poker_lobby() -> 'tables') x where (x ->> 'id')::bigint = t)
+    and public.poker_lobby() -> 'mine' = '[]', 'its row cannot be read directly either, so Realtime never sends it to outsiders');
+  perform pg_temp.ok(public.poker_join('nope12') ->> 'error' like '%No table has that code%' and public.poker_join('') ->> 'error' like '%No table%'
+    and public.poker_join(null) ->> 'error' like '%No table%', 'a wrong code finds nothing');
+  r := public.poker_join(' ' || lower(substr(v_code, 1, 3)) || '-' || substr(v_code, 4) || ' ');
+  perform pg_temp.ok((r ->> 'table')::bigint = t and r ->> 'code' = v_code, 'the right code finds the table, typed in any case and with a dash or spaces');
+  r := public.poker_sit(t, 500, null, lower(v_code));
+  perform pg_temp.ok((r -> 'me' ->> 'seat')::int = 0 and r -> 'table' ->> 'code' = v_code, 'and lets a friend sit down');
+  perform pg_temp.ok((select count(*) from public.poker_tables where id = t) = 1 and public.poker_visible(t) and public.poker_state(t) -> 'me' ->> 'stack' = '500',
+    'once seated, a player sees the table without sending the code again (and Realtime reaches them)');
+  -- The creator sits too and a hand is played like at any table.
+  perform pg_temp.pk_sit_code(t, 4, 500, v_code);
+  perform pg_temp.pk_tick(t, 5);
+  perform pg_temp.pk_as(4);
+  st := public.poker_state(t) -> 'table' -> 'state';
+  perform pg_temp.ok(st ->> 'phase' = 'preflop', 'a private table deals like any other');
+  st := pg_temp.pk_do(t, (st -> 'act' ->> 'seat')::int, 'fold');
+  perform pg_temp.pk_as(6);
+  perform pg_temp.ok(public.poker_state(t) ->> 'private' = 'true' and (select count(*) from public.poker_tables where id = t) = 0, 'and stays closed to everyone else while it is played');
+  perform pg_temp.pk_as(5);
+  perform public.poker_leave(t);
+  perform pg_temp.pk_as(4);
+  perform public.poker_leave(t);
+  -- The clock is pushed by someone with a seat, since an outsider's push is refused.
+  perform pg_temp.pk_age(t, 600);
+  perform pg_temp.pk_as(4);
+  perform public.poker_tick(t);
+  perform pg_temp.ok(pg_temp.pk_cash(4) + pg_temp.pk_cash(5) = v_cash and pg_temp.pk_where(4) is null and pg_temp.pk_where(5) is null,
+    'chips come back from a private table as from any other');
+
+  -- Limits: three open tables per player, five new ones a minute, ten code tries a minute, and none for guests.
+  perform pg_temp.pk_as(4);
+  r := public.poker_create('micro');
+  r := public.poker_create('high');
+  perform pg_temp.ok(public.poker_create('mid') ->> 'error' like '%three private tables%', 'a player can have three private tables open');
+  perform pg_temp.clear_limits();
+  for i in 1..10 loop perform public.poker_join('AAAAAA'); end loop;
+  perform pg_temp.expect_error($q$select public.poker_join('AAAAAA')$q$, '%Slow down%');
+  perform pg_temp.clear_limits();
+  for i in 1..5 loop perform public.poker_create('micro'); end loop;
+  perform pg_temp.expect_error($q$select public.poker_create('micro')$q$, '%Slow down%');
+  perform pg_temp.clear_limits();
+  perform set_config('request.jwt.claim.sub', current_setting('test.pkguest'), false);
+  perform pg_temp.ok(public.poker_create('low') ->> 'error' like '%Sign up%' and (public.poker_state(t, v_code) -> 'table' ->> 'private')::boolean, 'guests cannot open a private table, but can watch one with its code');
+end $$;
+reset role;
+set role anon;
+select set_config('request.jwt.claim.sub', '', false);
+select pg_temp.ok((select count(*) from (select id from public.poker_tables) q) = (select count(*) from (select id from public.poker_tables where public.poker_visible(id)) q)
+  and (select count(*) from (select id from public.poker_tables) q) = 4, 'signed-out visitors can read the four public tables and no private one');
+select pg_temp.expect_error($$select code from public.poker_tables$$, '%permission denied%');
+select pg_temp.expect_error($$select owner from public.poker_tables$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_create('low')$$, '%permission denied%');
+select pg_temp.expect_error($$select public.poker_join('AAAAAA')$$, '%permission denied%');
+reset role;
+-- Empty private tables close after half an hour; the public ones stay.
+update public.poker_tables set updated_at = now() - interval '20 minutes' where code is not null;
+select private.poker_sweep() as swept \gset
+select pg_temp.ok((select count(*) from public.poker_tables where code is not null) = 3, 'an empty private table is kept for half an hour, time to share the code');
+update public.poker_tables set updated_at = now() - interval '31 minutes' where code is not null;
+select private.poker_sweep() as swept \gset
+select pg_temp.ok((select count(*) from public.poker_tables where code is not null) = 0 and (select count(*) from public.poker_tables where code is null and stake <> 'test') = 4,
+  'then it closes; the public tables are untouched');
 
 -- A balance reset or a deleted account can't carry chips over or leave a hand stuck.
 -- (The simulation left some players broke, so everyone starts these with a fresh $100,000.)

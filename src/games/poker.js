@@ -190,3 +190,22 @@ export async function verifyProof(proof, expectedHash) {
   }
   return { ok: problems.length === 0, checked: reveals.length, problems }
 }
+
+/** The letters and digits a join code is made of: no 0, O, 1 or I, so a code read aloud or off a screen is not misread. */
+export const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+
+/**
+ * A join code as typed: any case, with spaces or dashes allowed, and the look-alikes
+ * a person might type for the digits (O for 0, I or L for 1) left alone, since no
+ * code contains them and the server will simply find no table.
+ */
+export const normalizeCode = (text) => String(text ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+
+/** True for six characters from the code alphabet. */
+export const isCodeShape = (code) => code.length === 6 && [...code].every((c) => CODE_ALPHABET.includes(c))
+
+/** "ABCDEF" as "ABC-DEF", easier to read out to a friend. */
+export const formatCode = (code) => (code?.length === 6 ? `${code.slice(0, 3)}-${code.slice(3)}` : (code ?? ''))
+
+/** The address of a table, with its join code when it has one. Relative to the site's own address bar (the site uses hash routing). */
+export const tableLink = (origin, tableId, code) => `${origin}/#/games/tables/${tableId}${code ? `?code=${normalizeCode(code)}` : ''}`

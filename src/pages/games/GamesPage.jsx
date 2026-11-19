@@ -221,8 +221,8 @@ const GAMES = [
           to: GAME_PATH.poker,
           id: 'poker',
           title: GAME_NAME.poker,
-          blurb: 'Sit down with other players for live hold’em. Fixed blinds, side pots, and no house cut: every chip lost is won by someone else.',
-          facts: ['2 to 6 players', 'No house cut', 'Sealed decks'],
+          blurb: 'Live No-Limit hold’em against other players, or open a private table and share a code with friends. No house cut: every chip lost is won by someone else.',
+          facts: ['2 to 6 players', 'Private tables', 'No house cut'],
           Art: TablesArt,
         },
       ]

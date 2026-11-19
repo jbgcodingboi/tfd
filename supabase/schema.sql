@@ -239,6 +239,11 @@ create table if not exists public.poker_tables (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+-- A private table has a join code its creator shares with friends. It is left out of the lobby, only players
+-- seated at it (or holding the code) can see or join it, and neither column is readable by clients.
+alter table public.poker_tables add column if not exists code text check (code ~ '^[A-Z2-9]{6}$');
+alter table public.poker_tables add column if not exists owner uuid references public.profiles (id) on delete set null;
+create unique index if not exists poker_tables_code_idx on public.poker_tables (code) where code is not null;
 create index if not exists poker_tables_deadline_idx on public.poker_tables (deadline) where deadline is not null;
 create index if not exists poker_tables_stake_idx on public.poker_tables (stake);
 
@@ -402,10 +407,17 @@ grant select (id, username, kind, market_id, market_title, side, side_label, sha
 revoke select on public.profiles from anon, authenticated;
 grant select (id, username, is_guest) on public.profiles to anon, authenticated;
 
--- Tables: anyone may read the public state of a table; nothing else about a hand is reachable.
+-- Tables: anyone may read the public state of a public table, and the player who opened a private one and the players
+-- seated at it may read theirs (which is also what lets Realtime reach them). Nothing else about a hand is reachable.
+/** Whether the caller may read a table's row: every public table, and a private one they are seated at. */
+create or replace function public.poker_visible(p_table bigint) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select coalesce((select t.code is null or t.owner = auth.uid() or exists (select 1 from private.poker_seats s where s.table_id = t.id and s.user_id = auth.uid())
+    from public.poker_tables t where t.id = p_table), false)
+$$;
 alter table public.poker_tables enable row level security;
 drop policy if exists "tables are public" on public.poker_tables;
-create policy "tables are public" on public.poker_tables for select using (true);
+create policy "tables are public" on public.poker_tables for select using (public.poker_visible(id));
 revoke all on public.poker_tables from anon, authenticated;
 grant select (id, stake, small_blind, big_blind, min_buy, max_buy, max_seats, seated, version, hand_no, deadline, state, updated_at)
   on public.poker_tables to anon, authenticated;
@@ -2613,6 +2625,10 @@ end $$;
 --   * Cash tables with 2 to 6 seats at fixed stakes (private.poker_stakes).
 --     Chips are whole dollars. A buy-in is 20 to 100 big blinds and moves
 --     from cash to the table stack; leaving moves the stack back.
+--   * Besides the public tables in the lobby, a signed-up player can open a
+--     private table at any stake. It gets a six-character code; only someone
+--     holding the code (or already seated) can see the table, watch or sit.
+--     A private table left empty for half an hour closes.
 --   * One seat per player across all tables. Guests can watch but not sit:
 --     a guest account is free and unlimited, so a seat for guests would let
 --     anyone pour fresh $100,000 balances into one real account.
@@ -3337,7 +3353,7 @@ begin
   -- One caller at a time, so a burst of visitors can't open a row of empty tables.
   if not pg_try_advisory_xact_lock(hashtext('poker-tables')) then return; end if;
   for st in select * from private.poker_stakes() loop
-    if not exists (select 1 from public.poker_tables where stake = st.stake and seated < max_seats) then
+    if not exists (select 1 from public.poker_tables where stake = st.stake and code is null and seated < max_seats) then
       insert into public.poker_tables (stake, small_blind, big_blind, min_buy, max_buy)
       values (st.stake, st.small_blind, st.big_blind, st.min_buy, st.max_buy) returning id into v_id;
       perform private.poker_publish(v_id);
@@ -3347,8 +3363,9 @@ end $$;
 
 /**
  * The backstop for tables nobody is watching: plays out overdue turns, and
- * closes spare empty tables (one with a free seat always stays open per
- * stake). Cheap when there is nothing to do: one indexed lookup.
+ * closes spare empty tables (one public table with a free seat always stays
+ * open per stake; a private one closes after half an hour empty). Cheap when
+ * there is nothing to do: one indexed lookup.
  */
 create or replace function private.poker_sweep() returns int
 language plpgsql volatile set search_path = '' as $$
@@ -3360,10 +3377,10 @@ begin
   end loop;
   delete from public.poker_tables where id in (
     select t.id from public.poker_tables t
-    where t.seated = 0 and t.updated_at < now() - interval '10 minutes'
-      and not exists (select 1 from private.poker_seats s where s.table_id = t.id)
-      and (t.stake not in (select stake from private.poker_stakes())
-        or exists (select 1 from public.poker_tables o where o.stake = t.stake and o.id < t.id and o.seated < o.max_seats))
+    where t.seated = 0 and not exists (select 1 from private.poker_seats s where s.table_id = t.id)
+      and case when t.code is not null then t.updated_at < now() - interval '30 minutes'
+        else t.updated_at < now() - interval '10 minutes' and (t.stake not in (select stake from private.poker_stakes())
+          or exists (select 1 from public.poker_tables o where o.stake = t.stake and o.code is null and o.id < t.id and o.seated < o.max_seats)) end
     for update of t skip locked);
   perform private.poker_ensure_tables();
   return n;
@@ -3373,8 +3390,10 @@ end $$;
 create or replace function private.poker_view(p_table bigint, p_user uuid) returns jsonb
 language sql volatile set search_path = '' as $$
   select jsonb_build_object(
+    -- The view is only built for callers allowed to see the table (see poker_allowed), so a private table's code can go with it.
     'table', jsonb_build_object('id', t.id, 'stake', t.stake, 'smallBlind', t.small_blind, 'bigBlind', t.big_blind,
-      'minBuy', t.min_buy, 'maxBuy', t.max_buy, 'seats', t.max_seats, 'version', t.version, 'state', t.state),
+      'minBuy', t.min_buy, 'maxBuy', t.max_buy, 'seats', t.max_seats, 'version', t.version, 'state', t.state,
+      'private', t.code is not null, 'code', t.code),
     'me', (select jsonb_build_object('seat', s.seat, 'stack', s.stack, 'cards', case when s.in_hand then to_jsonb(s.hole) end,
         'away', s.sitting_out, 'left', s.leaving)
       from private.poker_seats s where s.table_id = p_table and s.user_id = p_user),
@@ -3382,10 +3401,24 @@ language sql volatile set search_path = '' as $$
   from public.poker_tables t where t.id = p_table
 $$;
 
+/** Whether a player may see and join a table: any public table, and a private one when they hold its code, opened it, or are seated at it. */
+create or replace function private.poker_allowed(p_table bigint, p_user uuid, p_code text) returns boolean
+language sql stable set search_path = '' as $$
+  select coalesce((select t.code is null or t.owner = p_user or t.code = upper(regexp_replace(coalesce(p_code, ''), '[^A-Za-z0-9]', '', 'g'))
+      or exists (select 1 from private.poker_seats s where s.table_id = t.id and s.user_id = p_user)
+    from public.poker_tables t where t.id = p_table), false)
+$$;
+
+/** The answer for a private table the caller has no code for. It gives nothing about the table away. */
+create or replace function private.poker_locked() returns jsonb
+language sql immutable set search_path = '' as $$
+  select jsonb_build_object('error', 'This is a private table. Enter its code to join.', 'private', true)
+$$;
+
 -- What the browser calls. Refusals come back as { "error": "..." } rather than
 -- being raised, so the turns played out on the way in (and the rate limit) are kept.
 
-/** The lobby: every open table with its stakes and seats filled, and where the caller is seated. */
+/** The lobby: every public table with its stakes and seats filled, where the caller is seated, and the private tables they opened. */
 create or replace function public.poker_lobby() returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare v_user uuid := private.uid();
@@ -3396,19 +3429,27 @@ begin
     'tables', coalesce((select jsonb_agg(jsonb_build_object('id', t.id, 'stake', t.stake, 'smallBlind', t.small_blind, 'bigBlind', t.big_blind,
         'minBuy', t.min_buy, 'maxBuy', t.max_buy, 'seats', t.max_seats, 'seated', t.seated,
         'players', (select coalesce(jsonb_agg(x -> 'name'), '[]') from jsonb_array_elements(t.state -> 'seats') x where x <> 'null' and not (x ->> 'left')::boolean))
-      order by t.big_blind, t.id) from public.poker_tables t), '[]'),
-    'seat', (select jsonb_build_object('table', s.table_id, 'stack', s.stack) from private.poker_seats s where s.user_id = v_user and not s.leaving),
+      order by t.big_blind, t.id) from public.poker_tables t where t.code is null), '[]'),
+    'stakes', (select jsonb_agg(jsonb_build_object('stake', st.stake, 'smallBlind', st.small_blind, 'bigBlind', st.big_blind, 'minBuy', st.min_buy, 'maxBuy', st.max_buy)
+      order by st.big_blind) from private.poker_stakes() st),
+    'seat', (select jsonb_build_object('table', s.table_id, 'stack', s.stack, 'smallBlind', t.small_blind, 'bigBlind', t.big_blind, 'private', t.code is not null)
+      from private.poker_seats s join public.poker_tables t on t.id = s.table_id where s.user_id = v_user and not s.leaving),
+    -- Private tables this player opened that are still there, so they can find the code again.
+    'mine', coalesce((select jsonb_agg(jsonb_build_object('id', t.id, 'code', t.code, 'smallBlind', t.small_blind, 'bigBlind', t.big_blind, 'seated', t.seated, 'seats', t.max_seats)
+      order by t.id) from public.poker_tables t where t.owner = v_user and t.code is not null), '[]'),
     'canSit', not private.is_guest(v_user));
 end $$;
 
-/** The caller's view of a table. Also plays out any turn whose time is up. */
-create or replace function public.poker_state(p_table bigint) returns jsonb
+/** The caller's view of a table (a private one needs its code, or a seat at it). Also plays out any turn whose time is up. */
+drop function if exists public.poker_state(bigint);
+create or replace function public.poker_state(p_table bigint, p_code text default null) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare v_user uuid := private.uid(); t public.poker_tables;
 begin
   perform private.rate_limit(v_user, 'poker-state', 150);
   select * into t from public.poker_tables where id = p_table;
   if t.id is null then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  if not private.poker_allowed(p_table, v_user, p_code) then return private.poker_locked(); end if;
   if t.deadline is not null and t.deadline + make_interval(secs => private.poker_k('grace')) <= now() then
     perform 1 from public.poker_tables where id = p_table for update;
     perform private.poker_advance(p_table);
@@ -3429,6 +3470,7 @@ begin
   perform private.rate_limit(v_user, 'poker-tick', 60);
   select * into t from public.poker_tables where id = p_table;
   if t.id is null then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  if not private.poker_allowed(p_table, v_user, null) then return private.poker_locked(); end if;
   if t.deadline is not null and t.deadline + make_interval(secs => private.poker_k('grace')) <= now() then
     perform 1 from public.poker_tables where id = p_table for update;
     perform private.poker_advance(p_table);
@@ -3437,14 +3479,16 @@ begin
   return (select jsonb_build_object('version', version) from public.poker_tables where id = p_table);
 end $$;
 
-/** Takes a seat with a buy-in from cash. p_seat picks a seat (0 to 5); null takes the first free one. */
-create or replace function public.poker_sit(p_table bigint, p_buy_in numeric, p_seat int default null) returns jsonb
+/** Takes a seat with a buy-in from cash. p_seat picks a seat (0 to 5); null takes the first free one. A private table needs its code. */
+drop function if exists public.poker_sit(bigint, numeric, int);
+create or replace function public.poker_sit(p_table bigint, p_buy_in numeric, p_seat int default null, p_code text default null) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare v_user uuid := private.uid(); t public.poker_tables; pf public.portfolios; v_seat int; v_amt bigint; v_err text;
 begin
   perform private.rate_limit(v_user, 'poker-seat', 30);
   select * into t from public.poker_tables where id = p_table for update;
   if t.id is null then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  if not private.poker_allowed(p_table, v_user, p_code) then return private.poker_locked(); end if;
   perform private.poker_advance(p_table);
   select * into pf from public.portfolios where user_id = v_user for update;
   if private.is_guest(v_user) then v_err := 'Sign up to take a seat. Guests can watch.';
@@ -3480,6 +3524,7 @@ begin
   perform private.rate_limit(v_user, 'poker-seat', 30);
   perform 1 from public.poker_tables where id = p_table for update;
   if not found then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  if not private.poker_allowed(p_table, v_user, null) then return private.poker_locked(); end if;
   perform private.poker_advance(p_table);
   select * into s from private.poker_seats where table_id = p_table and user_id = v_user and not leaving;
   if s.seat is null then return private.poker_view(p_table, v_user) || jsonb_build_object('error', 'You are not seated at this table.'); end if;
@@ -3502,6 +3547,7 @@ begin
   perform private.rate_limit(v_user, 'poker-act', 90);
   perform 1 from public.poker_tables where id = p_table for update;
   if not found then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  if not private.poker_allowed(p_table, v_user, null) then return private.poker_locked(); end if;
   perform private.poker_advance(p_table);
   select * into h from private.poker_hands where table_id = p_table;
   select * into s from private.poker_seats where table_id = p_table and user_id = v_user;
@@ -3525,6 +3571,7 @@ begin
   perform private.rate_limit(v_user, 'poker-seat', 30);
   perform 1 from public.poker_tables where id = p_table for update;
   if not found then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  if not private.poker_allowed(p_table, v_user, null) then return private.poker_locked(); end if;
   perform private.poker_advance(p_table);
   select * into s from private.poker_seats where table_id = p_table and user_id = v_user and not leaving;
   if s.seat is null then return private.poker_view(p_table, v_user) || jsonb_build_object('error', 'You are not seated at this table.'); end if;
@@ -3548,6 +3595,7 @@ begin
   perform private.rate_limit(v_user, 'poker-seat', 30);
   select * into t from public.poker_tables where id = p_table for update;
   if t.id is null then return jsonb_build_object('error', 'That table has closed.', 'closed', true); end if;
+  if not private.poker_allowed(p_table, v_user, null) then return private.poker_locked(); end if;
   perform private.poker_advance(p_table);
   select * into h from private.poker_hands where table_id = p_table;
   select * into s from private.poker_seats where table_id = p_table and user_id = v_user and not leaving;
@@ -3575,15 +3623,64 @@ end $$;
  * that was shown (the board, hands shown at showdown, and the caller's own two
  * cards). src/games/poker.js verifyProof() checks them in the browser.
  */
-create or replace function public.poker_proof(p_table bigint) returns jsonb
+drop function if exists public.poker_proof(bigint);
+create or replace function public.poker_proof(p_table bigint, p_code text default null) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare v_user uuid := private.uid(); p private.poker_proofs;
 begin
   perform private.rate_limit(v_user, 'poker-proof', 20);
+  if exists (select 1 from public.poker_tables where id = p_table) and not private.poker_allowed(p_table, v_user, p_code) then return private.poker_locked(); end if;
   select * into p from private.poker_proofs where table_id = p_table;
   if p.table_id is null then return jsonb_build_object('error', 'No finished hand to check yet.'); end if;
   return jsonb_build_object('hand', p.hand_no, 'deckHash', p.deck_hash, 'commits', to_jsonb(p.commits),
     'reveals', (select coalesce(jsonb_agg(distinct x), '[]') from jsonb_array_elements(p.reveals || coalesce(p.holes -> v_user::text, '[]')) x));
+end $$;
+
+/**
+ * Opens a private table at one of the fixed stakes and returns its id and join
+ * code. The code is six characters from an alphabet with no look-alikes
+ * (no 0, O, 1 or I), drawn with the cryptographic RNG. Guests can't open one,
+ * and a player can have three open at a time.
+ */
+create or replace function public.poker_create(p_stake text) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid(); st record; v_id bigint; v_code text; alphabet text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; i int; tries int := 0;
+begin
+  perform private.rate_limit(v_user, 'poker-create', 5);
+  if private.is_guest(v_user) then return jsonb_build_object('error', 'Sign up to open a private table.'); end if;
+  select * into st from private.poker_stakes() s where s.stake = p_stake;
+  if st.stake is null then return jsonb_build_object('error', 'Pick one of the listed stakes.'); end if;
+  -- One at a time per player, so two quick clicks can't slip past the limit.
+  perform 1 from public.portfolios where user_id = v_user for update;
+  if (select count(*) from public.poker_tables where owner = v_user and code is not null) >= 3 then
+    return jsonb_build_object('error', 'You already have three private tables open. An empty one closes on its own after half an hour.');
+  end if;
+  loop
+    v_code := '';
+    for i in 1..6 loop v_code := v_code || substr(alphabet, private.rand_int(length(alphabet)) + 1, 1); end loop;
+    begin
+      insert into public.poker_tables (stake, small_blind, big_blind, min_buy, max_buy, code, owner)
+      values (st.stake, st.small_blind, st.big_blind, st.min_buy, st.max_buy, v_code, v_user) returning id into v_id;
+      exit;
+    exception when unique_violation then
+      tries := tries + 1;
+      if tries > 5 then raise; end if;
+    end;
+  end loop;
+  perform private.poker_publish(v_id);
+  return jsonb_build_object('table', v_id, 'code', v_code);
+end $$;
+
+/** Finds a private table by its code. Typed in any case, with or without spaces or dashes. */
+create or replace function public.poker_join(p_code text) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare v_user uuid := private.uid(); v_code text := upper(regexp_replace(coalesce(p_code, ''), '[^A-Za-z0-9]', '', 'g')); v_id bigint;
+begin
+  -- Few tries a minute: guessing a code is a one in a billion shot each time.
+  perform private.rate_limit(v_user, 'poker-join', 10);
+  select id into v_id from public.poker_tables where code = v_code and length(v_code) = 6;
+  if v_id is null then return jsonb_build_object('error', 'No table has that code. Check it and try again.'); end if;
+  return jsonb_build_object('table', v_id, 'code', v_code);
 end $$;
 
 -- A table with a free seat at every stake, from the first run on.
@@ -3688,6 +3785,8 @@ end $$;
 revoke execute on all functions in schema public from public, anon, authenticated;
 
 grant execute on function public.username_available(text) to anon, authenticated;
+-- Called by the row level security policy on poker_tables, as whoever is reading.
+grant execute on function public.poker_visible(bigint) to anon, authenticated;
 grant execute on function public.claim_guest(text) to authenticated;
 grant execute on function public.reset_password_with_code(text, text, text) to anon, authenticated;
 grant execute on function public.leaderboard() to anon, authenticated;
@@ -3723,14 +3822,16 @@ grant execute on function
   public.chicken_cashout(),
   public.chicken_auto(numeric, text, int),
   public.poker_lobby(),
-  public.poker_state(bigint),
+  public.poker_state(bigint, text),
   public.poker_tick(bigint),
-  public.poker_sit(bigint, numeric, int),
+  public.poker_sit(bigint, numeric, int, text),
+  public.poker_create(text),
+  public.poker_join(text),
   public.poker_leave(bigint),
   public.poker_act(bigint, text, numeric, int),
   public.poker_away(bigint, boolean),
   public.poker_buy(bigint, numeric),
-  public.poker_proof(bigint)
+  public.poker_proof(bigint, text)
 to authenticated;
 
 do $$ begin

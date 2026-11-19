@@ -1,19 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import GameShell from '../../components/games/GameShell.jsx'
 import SoundToggle from '../../components/games/SoundToggle.jsx'
 import ActionBar from '../../components/games/tables/ActionBar.jsx'
 import BuyInDialog from '../../components/games/tables/BuyInDialog.jsx'
+import PrivateTables, { CodeForm, ShareCode } from '../../components/games/tables/PrivateTables.jsx'
 import TableFelt from '../../components/games/tables/TableFelt.jsx'
 import EmptyState from '../../components/ui/EmptyState.jsx'
 import { ChevronLeftIcon, GridIcon } from '../../components/ui/Icons.jsx'
 import { GAME_NAME, GAME_PATH } from '../../games/names.js'
-import { formatChips, rankLabel, secondsLeft, verifyProof } from '../../games/poker.js'
+import { formatChips, isCodeShape, normalizeCode, rankLabel, secondsLeft, verifyProof } from '../../games/poker.js'
 import { tableSounds } from '../../games/sounds/tables.js'
 import { useDocumentTitle } from '../../hooks/useDocumentTitle.js'
 import { useNow } from '../../hooks/useNow.js'
 import { usePolling } from '../../hooks/usePolling.js'
-import { pokerLobby, pokerProof } from '../../services/backend/api.js'
+import { pokerCreate, pokerJoin, pokerLobby, pokerProof } from '../../services/backend/api.js'
 import { BACKEND_ENABLED } from '../../services/backend/config.js'
 import { useTable } from '../../services/games/tables.js'
 import { useAccountStore } from '../../store/accountStore.js'
@@ -22,7 +23,8 @@ import { toast } from '../../store/toastStore.js'
 import { useUiStore } from '../../store/uiStore.js'
 import './tables.css'
 
-const tablePath = (id) => `${GAME_PATH.poker}/${id}`
+/** A table's address; a private one carries its code so a reload (or a friend with the link) gets back in. */
+const tablePath = (id, code) => `${GAME_PATH.poker}/${id}${code ? `?code=${code}` : ''}`
 const reducedMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
 
 function Rules() {
@@ -34,6 +36,10 @@ function Rules() {
       </p>
       <ul className="list-disc space-y-1 pl-5">
         <li>You buy in for 20 to 100 big blinds from your available funds. The chips come back when you leave the table.</li>
+        <li>
+          To play with friends, open a private table: it gets a six-character code to share. Only people who have the code can see it or sit down, it stays
+          out of the lobby, and an empty one closes after half an hour. You can have three open at a time.
+        </li>
         <li>The two players after the dealer button post the blinds. Heads-up, the button posts the small blind and acts first before the flop.</li>
         <li>On your turn you fold, check or call, or bet or raise. A raise adds at least the last bet or raise; you can always go all-in for less.</li>
         <li>An all-in for less than a full raise does not let players who already acted raise again.</li>
@@ -53,10 +59,14 @@ function Rules() {
   )
 }
 
-/** Every open table by stakes, with seats filled, and the way back to a seat already taken. */
+/** Every open table by stakes, with seats filled, the way back to a seat already taken, and private tables for friends. */
 function Lobby() {
+  const navigate = useNavigate()
   const [lobby, setLobby] = useState(null)
   const [error, setError] = useState(null)
+  const [working, setWorking] = useState(false)
+  const [createError, setCreateError] = useState(null)
+  const [joinError, setJoinError] = useState(null)
   const load = useCallback(
     () =>
       pokerLobby()
@@ -65,6 +75,23 @@ function Lobby() {
     [],
   )
   usePolling(load, 8000, { immediate: true })
+
+  /** Runs a server call that answers { table, code } or { error } and opens the table it names. */
+  const open = async (call, fail) => {
+    if (working) return
+    setWorking(true)
+    fail(null)
+    try {
+      const res = await call()
+      if (res.error) fail(res.error)
+      else navigate(tablePath(res.table, res.code))
+    } catch (err) {
+      fail(err.message)
+    } finally {
+      setWorking(false)
+    }
+  }
+
   if (!lobby) {
     return error ? (
       <EmptyState icon={GridIcon} title="Could not load the tables" action={<button type="button" className="btn btn-primary" onClick={load}>Try again</button>}>
@@ -74,16 +101,16 @@ function Lobby() {
       <div className="skeleton h-64" aria-label="Loading tables" />
     )
   }
-  const mine = lobby.seat ? lobby.tables.find((t) => t.id === lobby.seat.table) : null
+  const seat = lobby.seat
   return (
     <div className="space-y-4">
-      {mine && (
+      {seat && (
         <div className="card flex flex-wrap items-center justify-between gap-3 border-warn/50 p-4">
           <p className="text-sm">
-            You have a seat at the <span className="font-semibold">${mine.smallBlind}/${mine.bigBlind}</span> table with{' '}
-            <span className="font-semibold tabular">{formatChips(lobby.seat.stack)}</span>.
+            You have a seat at {seat.private ? 'a private ' : 'the '}
+            <span className="font-semibold">${seat.smallBlind}/${seat.bigBlind}</span> table with <span className="font-semibold tabular">{formatChips(seat.stack)}</span>.
           </p>
-          <Link to={tablePath(mine.id)} className="btn btn-primary h-11 px-5">
+          <Link to={tablePath(seat.table)} className="btn btn-primary h-11 px-5">
             Back to my seat
           </Link>
         </div>
@@ -120,25 +147,34 @@ function Lobby() {
               </div>
               <p className="min-h-5 truncate text-xs text-subtle">{t.players.length ? t.players.join(', ') : 'Nobody here yet. Be the first to sit.'}</p>
               <span className="mt-auto text-sm font-semibold text-primary-300 group-hover:underline">
-                {mine?.id === t.id ? 'Back to my seat' : t.seated >= t.seats ? 'Watch' : lobby.canSit ? 'Open table' : 'Watch'}
+                {seat?.table === t.id ? 'Back to my seat' : t.seated >= t.seats ? 'Watch' : lobby.canSit ? 'Open table' : 'Watch'}
               </span>
             </Link>
           </li>
         ))}
       </ul>
-      <p className="text-xs leading-relaxed text-subtle">A new table opens whenever every table at a stake is full. You can sit at one table at a time.</p>
+      <PrivateTables
+        lobby={lobby}
+        working={working}
+        createError={createError}
+        joinError={joinError}
+        onCreate={(stake) => open(() => pokerCreate(stake), setCreateError)}
+        onJoin={(code) => open(() => pokerJoin(code), setJoinError)}
+        onOpen={(t) => navigate(tablePath(t.id, t.code))}
+      />
+      <p className="text-xs leading-relaxed text-subtle">A new public table opens whenever every one at a stake is full. You can sit at one table at a time.</p>
     </div>
   )
 }
 
 /** Confirms in the browser that the last hand's cards were the ones sealed before the deal. */
-function FairCheck({ tableId, hashes }) {
+function FairCheck({ tableId, code, hashes }) {
   const [result, setResult] = useState(null)
   const [busy, setBusy] = useState(false)
   const check = async () => {
     setBusy(true)
     try {
-      const proof = await pokerProof(tableId)
+      const proof = await pokerProof(tableId, code)
       if (proof.error) setResult({ error: proof.error })
       else setResult({ hand: proof.hand, hash: proof.deckHash, ...(await verifyProof(proof, hashes.current.get(proof.hand))) })
     } catch (err) {
@@ -215,12 +251,48 @@ function Banner({ state, seconds, winDelay }) {
   return null
 }
 
+/** A private table opened without its code (or with a wrong one): asks for the code. */
+function LockedTable({ tableId }) {
+  const navigate = useNavigate()
+  const [params] = useSearchParams()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(params.get('code') ? 'That code does not open this table.' : null)
+  const submit = async (code) => {
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await pokerJoin(code)
+      if (res.error) setError(res.error)
+      else if (res.table !== tableId) navigate(tablePath(res.table, res.code))
+      else navigate(tablePath(tableId, res.code), { replace: true })
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <div className="mx-auto max-w-md space-y-4 py-6">
+      <Link to={GAME_PATH.poker} className="inline-flex items-center gap-1 text-sm text-muted hover:text-fg">
+        <ChevronLeftIcon /> All tables
+      </Link>
+      <section className="card space-y-3 p-5">
+        <h2 className="text-lg font-semibold">This is a private table</h2>
+        <p className="text-sm text-muted">Enter the code your friend shared to watch or sit down.</p>
+        <CodeForm onSubmit={submit} busy={busy} error={error} />
+      </section>
+    </div>
+  )
+}
+
 function Room({ tableId }) {
+  const [params] = useSearchParams()
+  const code = normalizeCode(params.get('code')) || null
   const navigate = useNavigate()
   const user = useAccountStore((s) => s.user)
   const cash = useChips()
   const openAuth = useUiStore((s) => s.openAuth)
-  const { status, live, table, state, me, offset, actions } = useTable(tableId)
+  const { status, live, table, state, me, offset, actions } = useTable(tableId, isCodeShape(code ?? '') ? code : null)
   const now = useNow(state?.deadline ? 250 : 1000)
   const [working, setWorking] = useState(false)
   const [dialog, setDialog] = useState(null)
@@ -294,6 +366,7 @@ function Room({ tableId }) {
       </EmptyState>
     )
   }
+  if (status === 'locked') return <LockedTable tableId={tableId} />
   if (!state || !table) {
     return status === 'error' ? (
       <EmptyState icon={GridIcon} title="Could not reach the table" action={<button type="button" className="btn btn-primary" onClick={() => actions.reload().catch(() => {})}>Try again</button>}>
@@ -326,6 +399,7 @@ function Room({ tableId }) {
           <span className="rounded-full bg-surface-2 px-2.5 py-1 font-semibold tabular">
             ${table.smallBlind}/${table.bigBlind}
           </span>
+          {table.private && table.code && <ShareCode tableId={tableId} code={table.code} compact />}
           {state.hand > 0 && <span className="text-subtle tabular max-sm:sr-only">Hand #{state.hand}</span>}
           <span className={`flex items-center gap-1.5 ${live ? 'text-yes' : 'text-warn'}`} title={live ? 'Updates arrive live' : 'Live updates are down; the page is checking every few seconds'}>
             <span className={`size-2 rounded-full ${live ? 'bg-yes' : 'bg-warn'}`} aria-hidden="true" />
@@ -359,7 +433,7 @@ function Room({ tableId }) {
         summary={summaryOf(state, seconds)}
       />
      </div>
-      <FairCheck tableId={tableId} hashes={hashes} />
+      <FairCheck tableId={tableId} code={code} hashes={hashes} />
       <BuyInDialog
         key={dialog ? `${dialog.kind}-${dialog.seat ?? ''}` : 'closed'}
         open={dialog?.kind === 'sit'}
@@ -406,12 +480,12 @@ export default function TablesPage() {
     <GameShell
       game="poker"
       title={GAME_NAME.poker}
-      subtitle="Hold’em against other players, live. No house cut: what one player loses, another wins."
+      subtitle="Play against other players, live. No house cut: what one player loses, another wins."
       rules={<Rules />}
       compact={id !== null}
     >
       {!BACKEND_ENABLED ? (
-        <EmptyState icon={GridIcon} title="Tables need the shared server">
+        <EmptyState icon={GridIcon} title="Texas Hold’em needs the shared server">
           This game is played between signed-in players, so it only runs when the site is connected to its backend. Every other game works here on its own.
         </EmptyState>
       ) : id !== null ? (
