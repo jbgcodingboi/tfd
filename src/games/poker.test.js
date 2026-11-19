@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { sha256Hex } from './fair.js'
-import { betPresets, buyInBounds, buyInProblem, CODE_ALPHABET, compareRanks, formatChips, formatCode, isCodeShape, niceStep, normalizeCode, tableLink, handLabel, handRank, initials, isCard, potRaiseTo, potSummary, rankLabel, secondsLeft, toCard, verifyProof, viewPosition } from './poker.js'
+import { betPresets, buyInBounds, buyInProblem, CODE_ALPHABET, formatBlinds, compareRanks, formatChips, formatCode, isCodeShape, linkRange, niceStep, normalizeCode, privateStandard, tableLink, handLabel, handRank, initials, isCard, potRaiseTo, potSummary, rankLabel, secondsLeft, toCard, verifyProof, viewPosition } from './poker.js'
 
 const rank = (text) => handRank(text.split(' '))
 
@@ -229,5 +229,38 @@ describe('custom buy-ins for a private table', () => {
     expect(niceStep(10000, 50000)).toBe(250)
     expect(niceStep(0, 50_000_000)).toBe(50000)
     expect(niceStep(5, 5)).toBe(1)
+  })
+})
+
+describe('linked buy-in range', () => {
+  const bounds = buyInBounds(10) // $100 to $10,000
+  it('starts a private table at the smallest public buy-in and twice that', () => {
+    expect(privateStandard({ minBuy: 500, maxBuy: 2500 })).toEqual({ min: 500, max: 1000 })
+    expect(privateStandard({ minBuy: 50000, maxBuy: 250000 })).toEqual({ min: 50000, max: 100000 })
+  })
+  it('moves the largest to twice the smallest', () => {
+    expect(linkRange('min', '600', bounds)).toEqual({ min: '600', max: '1200' })
+    expect(linkRange('min', '100', bounds)).toEqual({ min: '100', max: '200' })
+  })
+  it('moves the smallest to half the largest', () => {
+    expect(linkRange('max', '2000', bounds)).toEqual({ max: '2000', min: '1000' })
+    expect(linkRange('max', '2001', bounds)).toEqual({ max: '2001', min: '1000' })
+  })
+  it('stays inside the bounds', () => {
+    expect(linkRange('min', '8000', bounds)).toEqual({ min: '8000', max: '10000' })
+    expect(linkRange('max', '150', bounds)).toEqual({ max: '150', min: '100' })
+  })
+  it('leaves the other end alone while something that is not a whole number is typed', () => {
+    expect(linkRange('min', '', bounds)).toEqual({ min: '' })
+    expect(linkRange('max', '12.5', bounds)).toEqual({ max: '12.5' })
+    expect(linkRange('min', '-4', bounds)).toEqual({ min: '-4' })
+  })
+})
+
+describe('blinds', () => {
+  it('are shown with thousands separators', () => {
+    expect(formatBlinds(5, 10)).toBe('$5/$10')
+    expect(formatBlinds(500, 1000)).toBe('$500/$1,000')
+    expect(formatBlinds(500, 1000, ' / ')).toBe('$500 / $1,000')
   })
 })

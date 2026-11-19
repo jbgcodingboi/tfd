@@ -126,7 +126,7 @@ export default function TableFelt({ table, state, me, now, offset, canSit, onSit
   const showdownPot = showdown ? (state.result?.pots ?? []).reduce((a, p) => a + p.amount, 0) : 0
 
   return (
-    <section className="felt tb-felt" aria-label={`Table, $${table.smallBlind} and $${table.bigBlind} blinds`}>
+    <section className="felt tb-felt" aria-label={`Table, ${formatChips(table.smallBlind)} and ${formatChips(table.bigBlind)} blinds`}>
       <div className="tb-line" aria-hidden="true" />
       <div className="tb-middle flex flex-col items-center gap-1 sm:gap-2">
         <div className="flex h-5 flex-wrap items-center justify-center gap-1.5 text-xs font-bold text-white tabular" aria-live="polite">

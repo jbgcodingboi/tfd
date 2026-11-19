@@ -918,7 +918,7 @@ select pg_temp.expect_error($$select pg_temp.rank('As Ks Qs Js 1s')$$, '%Bad car
 -- The lobby, sitting down and the money ---------------------------------------------
 set role authenticated;
 select pg_temp.pk_as(1);
-select pg_temp.ok((select jsonb_agg(t ->> 'stake') from jsonb_array_elements(public.poker_lobby() -> 'tables') t) = '["micro", "low", "mid", "high"]'
+select pg_temp.ok((select jsonb_agg(t ->> 'stake') from jsonb_array_elements(public.poker_lobby() -> 'tables') t) = '["low", "mid", "high", "top"]'
   and public.poker_lobby() -> 'seat' = 'null' and (public.poker_lobby() ->> 'canSit')::boolean, 'the lobby lists an open table at every stake');
 select (t ->> 'id')::bigint as lowtable from jsonb_array_elements(public.poker_lobby() -> 'tables') t where t ->> 'stake' = 'low' \gset
 do $$
@@ -929,7 +929,7 @@ begin
     and public.poker_sit(tbl, 250.5) ->> 'error' like '%whole dollars%' and public.poker_sit(tbl, 'NaN') ->> 'error' like '%$500%'
     and public.poker_sit(tbl, null) ->> 'error' like '%$500%', 'a public table''s buy-in is 50 to 250 big blinds, in whole dollars');
   perform pg_temp.ok((select jsonb_object_agg(x ->> 'stake', jsonb_build_array(x -> 'minBuy', x -> 'maxBuy')) from jsonb_array_elements(lobby -> 'tables') x)
-    = '{"micro": [100, 500], "low": [500, 2500], "mid": [2500, 12500], "high": [10000, 50000]}', 'the four public tables use the standard buy-in ranges');
+    = '{"low": [500, 2500], "mid": [2500, 12500], "high": [10000, 50000], "top": [50000, 250000]}', 'the four public tables use the standard buy-in ranges');
   perform pg_temp.ok(public.poker_sit(tbl, 500, 6) ->> 'error' like '%Pick a seat%' and public.poker_sit(-1, 500) ->> 'error' like '%closed%', 'seats and tables must exist');
   r := public.poker_sit(tbl, 500, 2);
   perform pg_temp.ok((r -> 'me' ->> 'seat')::int = 2 and (r -> 'me' ->> 'stack')::int = 500 and (r -> 'portfolio' ->> 'cash')::numeric = before - 500
@@ -960,11 +960,11 @@ do $$
 declare tbl bigint; i int; n int;
 begin
   perform pg_temp.pk_as(1);
-  select (t ->> 'id')::bigint into tbl from jsonb_array_elements(public.poker_lobby() -> 'tables') t where t ->> 'stake' = 'micro';
-  for i in 1..6 loop perform pg_temp.pk_sit(tbl, i, 100); end loop;
+  select (t ->> 'id')::bigint into tbl from jsonb_array_elements(public.poker_lobby() -> 'tables') t where t ->> 'stake' = 'low';
+  for i in 1..6 loop perform pg_temp.pk_sit(tbl, i, 500); end loop;
   perform pg_temp.pk_as(7);
-  perform pg_temp.ok(public.poker_sit(tbl, 100) ->> 'error' like '%full%', 'a seventh player finds the table full');
-  select count(*) into n from jsonb_array_elements(public.poker_lobby() -> 'tables') t where t ->> 'stake' = 'micro';
+  perform pg_temp.ok(public.poker_sit(tbl, 500) ->> 'error' like '%full%', 'a seventh player finds the table full');
+  select count(*) into n from jsonb_array_elements(public.poker_lobby() -> 'tables') t where t ->> 'stake' = 'low';
   perform pg_temp.ok(n = 2 and (select (t ->> 'seated')::int from jsonb_array_elements(public.poker_lobby() -> 'tables') t where (t ->> 'id')::bigint = tbl) = 6,
     'when every table at a stake is full a new one opens');
   for i in 1..6 loop
@@ -973,10 +973,10 @@ begin
   end loop;
 end $$;
 reset role;
-update public.poker_tables set updated_at = now() - interval '11 minutes' where stake = 'micro';
+update public.poker_tables set updated_at = now() - interval '11 minutes' where stake = 'low';
 select private.poker_sweep() as swept \gset
-select pg_temp.ok((select count(*) from public.poker_tables where stake = 'micro') = 1
-  and (select count(*) from public.poker_tables where stake in ('low', 'mid', 'high')) = 3, 'spare empty tables close after ten minutes; one per stake always stays');
+select pg_temp.ok((select count(*) from public.poker_tables where stake = 'low') = 1
+  and (select count(*) from public.poker_tables where stake in ('mid', 'high', 'top')) = 3, 'spare empty tables close after ten minutes; one per stake always stays');
 select pg_temp.ok(pg_temp.pk_chips() = :pk_total, 'sitting, adding chips and leaving never create or lose a chip');
 set role authenticated;
 
@@ -1028,6 +1028,10 @@ begin
     'only the winner goes to the live feed');
   perform pg_temp.ok((select (x ->> 'netWorth')::numeric = 100800 and (x ->> 'pnl')::numeric = 800 and (x -> 'games' ->> 'net')::numeric = 800 and (x ->> 'marketPnl')::numeric = 0
     from jsonb_array_elements(pg_temp.lb()) x where x ->> 'name' = 'pone'), 'chips at a table count toward net worth, and the win shows as games winnings on the leaderboard');
+  perform pg_temp.ok((select jsonb_object_agg(x ->> 'name', x -> 'poker') from jsonb_array_elements(pg_temp.lb()) x where x ->> 'name' in ('pone', 'ptwo', 'pthree', 'pfour'))
+    = '{"pone": {"hands": 1, "net": 800, "best": 800, "wagered": 550}, "ptwo": {"hands": 1, "net": -250, "best": 0, "wagered": 250},
+        "pthree": {"hands": 1, "net": -550, "best": 0, "wagered": 550}, "pfour": null}',
+    'the leaderboard carries each player''s poker hands, winnings, chips put in and best hand, and nothing for someone who has not played');
   perform pg_temp.pk_close(t);
 end $$;
 
@@ -1723,7 +1727,7 @@ begin
     and lobby -> 'mine' -> 0 ->> 'code' = v_code and (lobby -> 'mine' -> 0 ->> 'id')::bigint = t and jsonb_array_length(lobby -> 'stakes') = 4,
     'it is left out of the lobby, and its creator can find the code again');
   st := public.poker_state(t, v_code) -> 'table';
-  perform pg_temp.ok((st ->> 'private')::boolean and st ->> 'code' = v_code and (st ->> 'smallBlind')::int = 5 and (st ->> 'minBuy')::int = 500 and (st ->> 'maxBuy')::int = 2500, 'the code opens the table at the chosen stake, with its standard buy-in');
+  perform pg_temp.ok((st ->> 'private')::boolean and st ->> 'code' = v_code and (st ->> 'smallBlind')::int = 5 and (st ->> 'minBuy')::int = 500 and (st ->> 'maxBuy')::int = 1000, 'the code opens the table at the chosen stake, with the standard private buy-in (50 to 100 big blinds)');
   -- A creator may set the buy-in range: whole dollars, 10 to 1,000 big blinds, smallest first.
   perform pg_temp.clear_limits();
   perform pg_temp.ok(public.poker_create('low', 99, 1000) ->> 'error' like '%smallest buy-in at these blinds is $100%'
@@ -1778,11 +1782,11 @@ begin
 
   -- Limits: three open tables per player, five new ones a minute, ten code tries a minute, and none for guests.
   perform pg_temp.pk_as(4);
-  r := public.poker_create('micro', 30, 900);
-  perform pg_temp.ok((public.poker_state((r ->> 'table')::bigint) -> 'table' ->> 'minBuy')::int = 30 and (public.poker_state((r ->> 'table')::bigint) -> 'table' ->> 'maxBuy')::int = 900
+  r := public.poker_create('low', 150, 900);
+  perform pg_temp.ok((public.poker_state((r ->> 'table')::bigint) -> 'table' ->> 'minBuy')::int = 150 and (public.poker_state((r ->> 'table')::bigint) -> 'table' ->> 'maxBuy')::int = 900
     and (select x ->> 'maxBuy' from jsonb_array_elements(public.poker_lobby() -> 'mine') x where x ->> 'id' = r ->> 'table') = '900',
     'a private table can have its own buy-in range, which its creator sees in their list');
-  perform pg_temp.ok(public.poker_sit((r ->> 'table')::bigint, 29) ->> 'error' like '%$30 to $900%' and public.poker_sit((r ->> 'table')::bigint, 901) ->> 'error' like '%$30 to $900%',
+  perform pg_temp.ok(public.poker_sit((r ->> 'table')::bigint, 149) ->> 'error' like '%$150 to $900%' and public.poker_sit((r ->> 'table')::bigint, 901) ->> 'error' like '%$150 to $900%',
     'and sitting down follows it');
   r := public.poker_create('high');
   perform pg_temp.ok(public.poker_create('mid') ->> 'error' like '%three private tables%', 'a player can have three private tables open');
@@ -1790,8 +1794,8 @@ begin
   for i in 1..10 loop perform public.poker_join('AAAAAA'); end loop;
   perform pg_temp.expect_error($q$select public.poker_join('AAAAAA')$q$, '%Slow down%');
   perform pg_temp.clear_limits();
-  for i in 1..5 loop perform public.poker_create('micro'); end loop;
-  perform pg_temp.expect_error($q$select public.poker_create('micro')$q$, '%Slow down%');
+  for i in 1..5 loop perform public.poker_create('low'); end loop;
+  perform pg_temp.expect_error($q$select public.poker_create('low')$q$, '%Slow down%');
   perform pg_temp.clear_limits();
   perform set_config('request.jwt.claim.sub', current_setting('test.pkguest'), false);
   perform pg_temp.ok(public.poker_create('low') ->> 'error' like '%Sign up%' and (public.poker_state(t, v_code) -> 'table' ->> 'private')::boolean, 'guests cannot open a private table, but can watch one with its code');

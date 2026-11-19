@@ -1739,6 +1739,11 @@ language sql stable set search_path = '' as $$
     select g.user_id, sum(g.rounds) as rounds, sum(g.net) as net, sum(g.wagered) as wagered, greatest(max(g.best), 0) as best
     from private.game_totals g join public.portfolios p on p.user_id = g.user_id and g.run = p.run group by g.user_id
   ),
+  -- Hands of Texas Hold'em this run: how many, the chips won or lost across them, the chips put in, and the best single hand.
+  poker as (
+    select g.user_id, g.rounds as hands, g.net, g.wagered, greatest(g.best, 0) as best
+    from private.game_totals g join public.portfolios p on p.user_id = g.user_id and g.run = p.run where g.game = 'poker' and g.rounds > 0
+  ),
   fav as (
     select distinct on (g.user_id) g.user_id, g.game
     from private.game_totals g join public.portfolios p on p.user_id = g.user_id and g.run = p.run
@@ -1752,9 +1757,10 @@ language sql stable set search_path = '' as $$
     select pf.*, coalesce(pos.value, 0) as value, coalesce(pos.cost, 0) as cost, coalesce(pos.open, 0) as open,
       pf.cash + coalesce(pos.value, 0) + coalesce(chips.chips, 0) as net_worth, closed.wins, closed.total,
       coalesce(games.rounds, 0) as g_rounds, coalesce(games.net, 0) as g_net, coalesce(games.wagered, 0) as g_wagered,
-      coalesce(games.best, 0) as g_best, fav.game as fav
+      coalesce(games.best, 0) as g_best, fav.game as fav,
+      poker.hands as p_hands, poker.net as p_net, poker.wagered as p_wagered, poker.best as p_best
     from pf left join pos using (user_id) left join closed using (user_id) left join games using (user_id) left join fav using (user_id)
-      left join chips using (user_id)
+      left join chips using (user_id) left join poker using (user_id)
   )
   select coalesce(jsonb_agg(jsonb_build_object(
     'id', user_id, 'name', username, 'sim', false,
@@ -1767,7 +1773,8 @@ language sql stable set search_path = '' as $$
     'trades', trade_count,
     'winRate', case when total > 0 then round(wins * 100.0 / total, 2) end,
     'openPositions', open,
-    'games', jsonb_build_object('net', g_net, 'rounds', g_rounds, 'wagered', g_wagered, 'best', g_best, 'favorite', fav)
+    'games', jsonb_build_object('net', g_net, 'rounds', g_rounds, 'wagered', g_wagered, 'best', g_best, 'favorite', fav),
+    'poker', case when p_hands > 0 then jsonb_build_object('hands', p_hands, 'net', p_net, 'wagered', p_wagered, 'best', p_best) end
   ) order by net_worth desc), '[]')
   from (select * from rows order by net_worth desc limit 500) r
 $$;
@@ -2625,9 +2632,10 @@ end $$;
 -- Seats and stakes
 --   * Cash tables with 2 to 6 seats at fixed stakes (private.poker_stakes).
 --     Chips are whole dollars. A public table's buy-in is 50 to 250 big
---     blinds, and a private table's creator sets their own range (see
---     poker_create). The buy-in moves from cash to the table stack; leaving
---     moves the stack back.
+--     blinds (everyone starts with $100,000, so the blinds run from $5/$10
+--     to $500/$1,000). A private table's creator sets their own range (see
+--     poker_create; unless they do, it is 50 to 100 big blinds). The buy-in
+--     moves from cash to the table stack; leaving moves the stack back.
 --   * Besides the public tables in the lobby, a signed-up player can open a
 --     private table at any stake. It gets a six-character code; only someone
 --     holding the code (or already seated) can see the table, watch or sit.
@@ -2728,7 +2736,7 @@ $$;
 
 create or replace function private.poker_stakes() returns table (stake text, small_blind bigint, big_blind bigint, min_buy bigint, max_buy bigint)
 language sql immutable set search_path = '' as $$
-  values ('micro', 1::bigint, 2::bigint, 100::bigint, 500::bigint), ('low', 5, 10, 500, 2500), ('mid', 25, 50, 2500, 12500), ('high', 100, 200, 10000, 50000)
+  values ('low', 5::bigint, 10::bigint, 500::bigint, 2500::bigint), ('mid', 25, 50, 2500, 12500), ('high', 100, 200, 10000, 50000), ('top', 500, 1000, 50000, 250000)
 $$;
 
 -- Hand evaluation ---------------------------------------------------------------
@@ -3663,8 +3671,9 @@ begin
     or (p_max_buy is not null and (p_max_buy <> trunc(p_max_buy) or not (p_max_buy > 0 and p_max_buy < 1e15))) then
     return jsonb_build_object('error', 'Buy-ins are whole dollars.');
   end if;
+  -- Unless set, a private table's range is 50 to 100 big blinds: the largest is twice the smallest.
   v_min := coalesce(p_min_buy::bigint, st.min_buy);
-  v_max := coalesce(p_max_buy::bigint, greatest(st.max_buy, v_min));
+  v_max := coalesce(p_max_buy::bigint, 2 * v_min);
   if v_min < v_floor then return jsonb_build_object('error', format('The smallest buy-in at these blinds is $%s (10 big blinds).', v_floor)); end if;
   if v_max < v_min then return jsonb_build_object('error', 'The largest buy-in can''t be below the smallest.'); end if;
   if v_max > v_ceil then return jsonb_build_object('error', format('The largest buy-in at these blinds is $%s.', v_ceil)); end if;
@@ -3706,6 +3715,10 @@ end $$;
 update public.poker_tables t set min_buy = st.min_buy, max_buy = st.max_buy
 from private.poker_stakes() st
 where t.code is null and t.stake = st.stake and (t.min_buy, t.max_buy) is distinct from (st.min_buy, st.max_buy);
+-- Empty tables of a stake that has been retired (the old $1/$2 level) close now; ones with players close once they empty.
+delete from public.poker_tables t
+where t.code is null and t.stake not in (select stake from private.poker_stakes()) and t.seated = 0
+  and not exists (select 1 from private.poker_seats s where s.table_id = t.id);
 
 -- A table with a free seat at every stake, from the first run on.
 do $$ begin

@@ -52,7 +52,9 @@ Requires Node 20.19+ (Node 22 recommended).
 - **Social**: an activity feed mixing your local trades with clearly tagged simulated trades, and three
   leaderboards of local accounts plus simulated pros: **Overall** (net worth), **Markets** (trading PnL this run:
   realized plus unrealized, leaving out games) and **Games** (net game winnings this run, with rounds, amount
-  wagered, biggest win and favorite game). Markets PnL plus games net always equals the overall PnL. The selected
+  wagered, biggest win and favorite game). Markets PnL plus games net always equals the overall PnL. With the
+  backend there is a fourth, **Poker**: chips won at Texas Hold'em this run, with hands played, per hand, biggest
+  win and chips played, for players who have played a hand. The selected
   board is kept in the URL (`#/leaderboard?board=games`).
 - **Guest mode**: everything is browsable without an account; trading, the portfolio and resets need one.
 - **Games**: Roulette, Blackjack, Plinko, Dice, Mines, Chicken Cross, Limbo (with Crash) and the Golden Sevens slot,
@@ -206,14 +208,17 @@ sampling, so outcomes are unbiased.
   Boneyard, whose past rounds stay in players' history.
 
 - **Texas Hold'em** (backend mode only, since it needs other players; its address is `#/games/tables`): live No-Limit Hold'em at shared tables of
-  two to six, at four fixed stakes ($1/$2, $5/$10, $25/$50, $100/$200). A buy-in of 50 to 250 big blinds ($100 to $500 up to $10,000 to $50,000, which is meant to suit a $100,000 balance) moves
+  two to six, at four fixed stakes ($5/$10, $25/$50, $100/$200, $500/$1,000), sized for the $100,000 everyone starts
+  with. A buy-in of 50 to 250 big blinds ($500 to $2,500 up to $50,000 to $250,000, limited by your cash) moves
   from cash to a table stack and comes back when you leave. There is no rake: every hand's results sum to zero.
   The database runs the whole game (shuffle, deal, every move, side pots, hand ranking, payouts); the browser only
   sends fold, check, call, bet, raise, sit and leave, and draws what comes back. Each player has 25 seconds to
   act; out of time they are checked or folded, and after two timeouts sat out. **Private tables**: a signed-up
   player can open one at any stake (three at a time); it gets a six-character code to share, stays out of the lobby,
   and only people holding the code (or already seated) can see it, watch or sit. Its creator also sets the buy-in range
-  (typed or with sliders, 10 to 1,000 big blinds). An empty one closes after half an hour. Guests can watch but not sit (see
+  (typed or with sliders, 10 to 1,000 big blinds): it starts at 50 to 100 big blinds, **Auto 1:2** keeps the largest at
+  twice the smallest as either one moves, **Custom…** sets each end on its own, and **Reset to standard** goes back.
+  An empty one closes after half an hour. Guests can watch but not sit (see
   [Tables](#tables)). The full rule set is the comment at the top of the poker section of `supabase/schema.sql`.
 
 Dice, Limbo, Golden Sevens, Mines and Chicken Cross have **auto play**: a number of bets, raising the bet by a percentage after a win or a
@@ -334,7 +339,7 @@ browser. Connecting a free [Supabase](https://supabase.com) project turns Chami 
   like Chaminade don't allow gambling or games of chance, even with play money) and one "I understand and agree" button
   (`#/terms`). Agreement is stored per browser and versioned by `TERMS_VERSION` in `src/config.js`, and sign-ups
   record the accepted version in the account's metadata.
-- **A true leaderboard**: every player, valued on the server, on the Overall, Markets and Games boards.
+- **A true leaderboard**: every player, valued on the server, on the Overall, Markets, Games and Poker boards.
 - **A live feed** of everyone's trades and game results over Supabase Realtime.
 - **Privacy**: the feeds and profiles show only usernames. Nobody can read which account a feed row belongs to,
   when an account was made, or anyone's email, and password recovery answers the same way whether or not an

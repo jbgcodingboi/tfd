@@ -1,5 +1,5 @@
 import { useId, useState } from 'react'
-import { buyInBounds, buyInProblem, formatChips, formatCode, isCodeShape, niceStep, normalizeCode, tableLink } from '../../../games/poker.js'
+import { buyInBounds, buyInProblem, formatBlinds, formatChips, formatCode, isCodeShape, linkRange, niceStep, normalizeCode, privateStandard, tableLink } from '../../../games/poker.js'
 import { copyText } from './copyText.js'
 
 /** A box to type a join code into. `onSubmit` gets the normalized code; the caller shows what the server answers. */
@@ -113,18 +113,33 @@ function AmountField({ label, value, onChange, lo, hi }) {
  */
 export default function PrivateTables({ lobby, working, createError, joinError, onCreate, onJoin, onOpen }) {
   const [stake, setStake] = useState(null)
-  // The buy-in being typed or dragged, for the stake it was set at (switching stake goes back to that stake's standard range).
+  // The buy-in being typed or dragged, for the stake it was set at (switching stake goes back to that stake's starting range).
   const [edit, setEdit] = useState(null)
+  // Auto: the largest buy-in follows the smallest at twice its size, and the other way round. Custom: each end is set on its own.
+  const [linked, setLinked] = useState(true)
   const stakes = lobby.stakes ?? []
-  const chosen = stakes.find((s) => s.stake === stake) ?? stakes[1] ?? stakes[0]
+  const chosen = stakes.find((s) => s.stake === stake) ?? stakes[0]
+  const start = chosen ? privateStandard(chosen) : { min: 0, max: 0 }
   const typed = edit && edit.stake === chosen?.stake ? edit : null
-  const minText = typed?.min ?? String(chosen?.minBuy ?? '')
-  const maxText = typed?.max ?? String(chosen?.maxBuy ?? '')
+  const minText = typed?.min ?? String(start.min)
+  const maxText = typed?.max ?? String(start.max)
   const range = { min: Number(minText), max: Number(maxText) }
   const bounds = chosen ? buyInBounds(chosen.bigBlind) : { min: 0, max: 0 }
   const problem = chosen && (minText === '' || maxText === '') ? 'Enter both buy-ins.' : chosen ? buyInProblem(range, chosen.bigBlind) : null
-  const standard = !typed || (minText === String(chosen?.minBuy) && maxText === String(chosen?.maxBuy))
+  const standard = minText === String(start.min) && maxText === String(start.max)
   const setBuyIn = (patch) => setEdit({ stake: chosen.stake, min: minText, max: maxText, ...patch })
+  const changeEnd = (side, v) => setBuyIn(linked ? linkRange(side, v, bounds) : { [side]: v })
+  const reset = () => {
+    setEdit(null)
+    setLinked(true)
+  }
+  // In Auto each slider can only go as far as keeps its partner (twice or half of it) inside the limits.
+  const minSlider = linked
+    ? { lo: bounds.min, hi: Math.max(bounds.min, Math.floor(bounds.max / 2)) }
+    : { lo: bounds.min, hi: Math.max(bounds.min, Math.min(bounds.max, Number(maxText) || bounds.max)) }
+  const maxSlider = linked
+    ? { lo: Math.min(bounds.max, 2 * bounds.min), hi: bounds.max }
+    : { lo: Math.min(bounds.max, Math.max(bounds.min, Number(minText) || bounds.min)), hi: bounds.max }
   return (
     <section className="card space-y-4 p-4" aria-labelledby="friends-heading">
       <div>
@@ -151,7 +166,7 @@ export default function PrivateTables({ lobby, working, createError, joinError, 
                     onClick={() => setStake(s.stake)}
                   >
                     <span>
-                      ${s.smallBlind}/${s.bigBlind}
+                      {formatBlinds(s.smallBlind, s.bigBlind)}
                     </span>
                   </button>
                 ))}
@@ -159,28 +174,43 @@ export default function PrivateTables({ lobby, working, createError, joinError, 
               {chosen && (
                 <fieldset className="space-y-1 rounded-xl border border-line p-3">
                   <legend className="px-1 text-xs font-medium text-muted">Buy-in range</legend>
-                  <AmountField
-                    label="Smallest buy-in"
-                    value={minText}
-                    onChange={(v) => setBuyIn({ min: v })}
-                    lo={bounds.min}
-                    hi={Math.max(bounds.min, Math.min(bounds.max, Number(maxText) || bounds.max))}
-                  />
-                  <AmountField
-                    label="Largest buy-in"
-                    value={maxText}
-                    onChange={(v) => setBuyIn({ max: v })}
-                    lo={Math.min(bounds.max, Math.max(bounds.min, Number(minText) || bounds.min))}
-                    hi={bounds.max}
-                  />
-                  <div className="flex items-center justify-between gap-2 text-xs text-subtle">
-                    <span>{standard ? 'Standard range for these blinds.' : 'Custom range.'}</span>
-                    {!standard && (
-                      <button type="button" className="font-semibold text-primary-300 hover:underline" onClick={() => setEdit(null)}>
-                        Use standard
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="inline-flex rounded-lg border border-line p-0.5" role="group" aria-label="How the two buy-ins move">
+                      <button
+                        type="button"
+                        className={`btn h-8 px-3 text-xs ${linked ? 'btn-primary' : 'btn-ghost border-transparent'}`}
+                        aria-pressed={linked}
+                        onClick={() => {
+                          setLinked(true)
+                          if (typed) setBuyIn(linkRange('min', minText, bounds))
+                        }}
+                      >
+                        Auto 1:2
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn h-8 px-3 text-xs ${!linked ? 'btn-primary' : 'btn-ghost border-transparent'}`}
+                        aria-pressed={!linked}
+                        onClick={() => setLinked(false)}
+                      >
+                        Custom…
+                      </button>
+                    </div>
+                    {(!standard || !linked) && (
+                      <button type="button" className="btn btn-ghost h-8 px-3 text-xs" onClick={reset}>
+                        Reset to standard
                       </button>
                     )}
                   </div>
+                  <AmountField label="Smallest buy-in" value={minText} onChange={(v) => changeEnd('min', v)} lo={minSlider.lo} hi={minSlider.hi} />
+                  <AmountField label="Largest buy-in" value={maxText} onChange={(v) => changeEnd('max', v)} lo={maxSlider.lo} hi={maxSlider.hi} />
+                  <p className="text-xs text-subtle">
+                    {linked
+                      ? standard
+                        ? 'Standard: the largest is twice the smallest, and moving one moves the other.'
+                        : 'Auto: the largest is always twice the smallest. Choose Custom… to set each yourself.'
+                      : 'Custom: set the smallest and the largest yourself.'}
+                  </p>
                   {problem && (
                     <p className="text-sm text-no" role="alert">
                       {problem}
@@ -192,7 +222,7 @@ export default function PrivateTables({ lobby, working, createError, joinError, 
                 type="button"
                 className="btn btn-primary h-11 w-full"
                 disabled={working || !chosen || Boolean(problem)}
-                onClick={() => onCreate(chosen.stake, standard ? {} : range)}
+                onClick={() => onCreate(chosen.stake, range)}
               >
                 {working ? 'Opening…' : 'Create table'}
               </button>
@@ -215,7 +245,7 @@ export default function PrivateTables({ lobby, working, createError, joinError, 
             {lobby.mine.map((t) => (
               <li key={t.id} className="flex flex-wrap items-center justify-between gap-2 py-2">
                 <span className="tabular">
-                  ${t.smallBlind}/${t.bigBlind} · {t.seated}/{t.seats} seated
+                  {formatBlinds(t.smallBlind, t.bigBlind)} · {t.seated}/{t.seats} seated
                   {t.minBuy ? <span className="block text-xs text-subtle">Buy-in {formatChips(t.minBuy)} to {formatChips(t.maxBuy)}</span> : null}
                 </span>
                 <span className="flex flex-wrap items-center gap-2">

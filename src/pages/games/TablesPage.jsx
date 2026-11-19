@@ -9,7 +9,7 @@ import TableFelt from '../../components/games/tables/TableFelt.jsx'
 import EmptyState from '../../components/ui/EmptyState.jsx'
 import { ChevronLeftIcon, GridIcon } from '../../components/ui/Icons.jsx'
 import { GAME_NAME, GAME_PATH } from '../../games/names.js'
-import { formatChips, isCodeShape, normalizeCode, rankLabel, secondsLeft, verifyProof } from '../../games/poker.js'
+import { formatBlinds, formatChips, isCodeShape, normalizeCode, rankLabel, secondsLeft, verifyProof } from '../../games/poker.js'
 import { tableSounds } from '../../games/sounds/tables.js'
 import { useDocumentTitle } from '../../hooks/useDocumentTitle.js'
 import { useNow } from '../../hooks/useNow.js'
@@ -109,7 +109,7 @@ function Lobby() {
         <div className="card flex flex-wrap items-center justify-between gap-3 border-warn/50 p-4">
           <p className="text-sm">
             You have a seat at {seat.private ? 'a private ' : 'the '}
-            <span className="font-semibold">${seat.smallBlind}/${seat.bigBlind}</span> table with <span className="font-semibold tabular">{formatChips(seat.stack)}</span>.
+            <span className="font-semibold">{formatBlinds(seat.smallBlind, seat.bigBlind)}</span> table with <span className="font-semibold tabular">{formatChips(seat.stack)}</span>.
           </p>
           <Link to={tablePath(seat.table)} className="btn btn-primary h-11 px-5">
             Back to my seat
@@ -131,7 +131,7 @@ function Lobby() {
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <h2 className="text-lg font-semibold tabular">
-                    ${t.smallBlind} / ${t.bigBlind}
+                    {formatBlinds(t.smallBlind, t.bigBlind, ' / ')}
                   </h2>
                   <p className="text-xs text-muted tabular">
                     Buy-in {formatChips(t.minBuy)} to {formatChips(t.maxBuy)}
@@ -398,7 +398,7 @@ function Room({ tableId }) {
         </Link>
         <div className="flex items-center gap-2 text-xs">
           <span className="rounded-full bg-surface-2 px-2.5 py-1 font-semibold tabular">
-            ${table.smallBlind}/${table.bigBlind}
+            {formatBlinds(table.smallBlind, table.bigBlind)}
           </span>
           {table.private && table.code && <ShareCode tableId={tableId} code={table.code} compact />}
           {state.hand > 0 && <span className="text-subtle tabular max-sm:sr-only">Hand #{state.hand}</span>}
@@ -439,7 +439,7 @@ function Room({ tableId }) {
         key={dialog ? `${dialog.kind}-${dialog.seat ?? ''}` : 'closed'}
         open={dialog?.kind === 'sit'}
         onClose={() => setDialog(null)}
-        title={`Sit at the $${table.smallBlind}/$${table.bigBlind} table`}
+        title={`Sit at the ${formatBlinds(table.smallBlind, table.bigBlind)} table`}
         description="Choose how many chips to bring. You are dealt in on the next hand."
         min={table.minBuy}
         max={table.maxBuy}
