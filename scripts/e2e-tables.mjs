@@ -94,10 +94,10 @@ async function main() {
     if (p === b) await b.page.goto(tableUrl)
     await p.page.getByRole('button', { name: 'Take a seat' }).click()
     await p.page.getByRole('button', { name: 'Most' }).click()
-    await p.page.getByRole('button', { name: /Sit down with \$200/ }).click()
+    await p.page.getByRole('button', { name: /Sit down with \$500/ }).click()
     await p.page.getByLabel(/\(you\), \$/).waitFor()
   }
-  check(true, 'both players bought in for $200 and are seated')
+  check(true, 'both players bought in for the $500 maximum and are seated')
 
   // The first hand is dealt by the clock. Each player sees two cards of their own and none of the other's.
   await a.page.getByText(/Hand #1/).waitFor({ timeout: 20000 })
@@ -147,7 +147,7 @@ async function main() {
   await shot(a.page, '4-showdown.png')
   const state = await post('/rest/v1/rpc/poker_state', { p_table: Number(tableUrl.split('/').pop()) }, a.session.access_token)
   const stacks = state.table.state.seats.filter(Boolean).map((s) => s.stack)
-  check(stacks.reduce((x, y) => x + y, 0) === 400, `the two stacks still add up to the $400 brought to the table (${stacks.join(' + ')})`)
+  check(stacks.reduce((x, y) => x + y, 0) === 1000, `the two stacks still add up to the $1,000 brought to the table (${stacks.join(' + ')})`)
 
   // The fairness check opens the seals of the cards that were shown.
   await a.page.getByText('Fair deal', { exact: true }).click()
@@ -172,6 +172,13 @@ async function main() {
   // A private table: one player opens it and reads out its code, a friend types the code in and sits down.
   await a.page.goto(`${SITE}/#/games/tables`)
   await a.page.getByRole('radio', { name: '$1/$2' }).click()
+  check((await a.page.getByLabel('Smallest buy-in', { exact: true }).inputValue()) === '100' && (await a.page.getByLabel('Largest buy-in', { exact: true }).inputValue()) === '500', 'the form starts at the standard $100 to $500 buy-in')
+  await a.page.getByLabel('Smallest buy-in', { exact: true }).fill('19')
+  await a.page.getByText(/smallest buy-in at these blinds is \$20/).waitFor()
+  check(await a.page.getByRole('button', { name: 'Create table' }).isDisabled(), 'a buy-in below 10 big blinds is refused on the form')
+  await a.page.getByLabel('Smallest buy-in', { exact: true }).fill('150')
+  await a.page.getByLabel('Largest buy-in slider').fill('300')
+  check((await a.page.getByLabel('Largest buy-in', { exact: true }).inputValue()) === '300', 'the slider moves the typed amount')
   await a.page.getByRole('button', { name: 'Create table' }).click()
   await a.page.waitForURL(/games\/tables\/\d+\?code=[A-Z2-9]{6}/)
   const privateUrl = a.page.url()
@@ -193,9 +200,9 @@ async function main() {
   await b.page.waitForURL(/code=/)
   await b.page.getByRole('button', { name: 'Take a seat' }).click()
   await b.page.getByRole('button', { name: 'Least' }).click()
-  await b.page.getByRole('button', { name: /Sit down with/ }).click()
+  await b.page.getByRole('button', { name: 'Sit down with $150' }).click()
   await b.page.getByLabel(/\(you\), \$/).waitFor()
-  check(true, 'a friend typed the code and took a seat')
+  check(true, 'a friend typed the code and sat down at the $150 minimum of the custom range')
   const spectator = await post('/rest/v1/rpc/poker_state', { p_table: Number(privateId) }, a.session.access_token)
   const outsider = await post('/rest/v1/rpc/poker_state', { p_table: Number(privateId) }, (await post('/auth/v1/signup', { email: 'outsider_x@users.chamimarket.app', password: 'correct horse battery', data: { username: 'outsider_x' } })).access_token)
   check(spectator.table && outsider.private === true && !outsider.table, `a player without the code gets nothing back about the table (${JSON.stringify(outsider).slice(0, 120)})`)

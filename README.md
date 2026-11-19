@@ -206,13 +206,14 @@ sampling, so outcomes are unbiased.
   Boneyard, whose past rounds stay in players' history.
 
 - **Texas Hold'em** (backend mode only, since it needs other players; its address is `#/games/tables`): live No-Limit Hold'em at shared tables of
-  two to six, at four fixed stakes ($1/$2, $5/$10, $25/$50, $100/$200). A buy-in of 20 to 100 big blinds moves
+  two to six, at four fixed stakes ($1/$2, $5/$10, $25/$50, $100/$200). A buy-in of 50 to 250 big blinds ($100 to $500 up to $10,000 to $50,000, which is meant to suit a $100,000 balance) moves
   from cash to a table stack and comes back when you leave. There is no rake: every hand's results sum to zero.
   The database runs the whole game (shuffle, deal, every move, side pots, hand ranking, payouts); the browser only
   sends fold, check, call, bet, raise, sit and leave, and draws what comes back. Each player has 25 seconds to
   act; out of time they are checked or folded, and after two timeouts sat out. **Private tables**: a signed-up
   player can open one at any stake (three at a time); it gets a six-character code to share, stays out of the lobby,
-  and only people holding the code (or already seated) can see it, watch or sit. An empty one closes after half an hour. Guests can watch but not sit (see
+  and only people holding the code (or already seated) can see it, watch or sit. Its creator also sets the buy-in range
+  (typed or with sliders, 10 to 1,000 big blinds). An empty one closes after half an hour. Guests can watch but not sit (see
   [Tables](#tables)). The full rule set is the comment at the top of the poker section of `supabase/schema.sql`.
 
 Dice, Limbo, Golden Sevens, Mines and Chicken Cross have **auto play**: a number of bets, raising the bet by a percentage after a win or a

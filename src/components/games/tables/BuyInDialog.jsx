@@ -1,5 +1,5 @@
 import { useId, useState } from 'react'
-import { formatChips } from '../../../games/poker.js'
+import { formatChips, niceStep } from '../../../games/poker.js'
 import Modal from '../../ui/Modal.jsx'
 
 /**
@@ -12,6 +12,8 @@ export default function BuyInDialog({ open, onClose, title, description, min, ma
   const top = Math.floor(Math.min(max, cash))
   const possible = top >= min
   const [picked, setPicked] = useState(null)
+  // What is being typed, so a half-typed number isn't rewritten under the player's fingers; the amount itself is always kept in range.
+  const [typing, setTyping] = useState(null)
   const amount = Math.min(top, Math.max(min, picked ?? Math.min(top, Math.round((min + max) / 2))))
   return (
     <Modal open={open} onClose={onClose} title={title} description={description} variant="sheet">
@@ -24,19 +26,42 @@ export default function BuyInDialog({ open, onClose, title, description, min, ma
           }}
         >
           <div>
-            <label htmlFor={id} className="flex items-baseline justify-between text-sm">
-              <span className="text-muted">Chips to bring</span>
-              <span className="text-2xl font-bold tabular">{formatChips(amount)}</span>
-            </label>
+            <div className="flex items-center justify-between gap-3 text-sm">
+              <label htmlFor={`${id}-amount`} className="text-muted">
+                Chips to bring
+              </label>
+              <span className="relative">
+                <span className="pointer-events-none absolute top-1/2 left-3 -translate-y-1/2 text-lg font-bold text-muted">$</span>
+                <input
+                  id={`${id}-amount`}
+                  type="number"
+                  inputMode="numeric"
+                  min={min}
+                  max={top}
+                  step={1}
+                  className="input h-11 w-40 py-1 pl-7 text-right text-xl font-bold tabular"
+                  value={typing ?? amount}
+                  onChange={(e) => {
+                    setTyping(e.target.value)
+                    if (e.target.value !== '') setPicked(Number(e.target.value))
+                  }}
+                  onBlur={() => setTyping(null)}
+                />
+              </span>
+            </div>
             <input
               id={id}
               type="range"
               className="tb-range mt-1"
               min={min}
               max={top}
-              step={1}
+              step={niceStep(min, top)}
               value={amount}
-              onChange={(e) => setPicked(Number(e.target.value))}
+              onChange={(e) => {
+                setTyping(null)
+                setPicked(Number(e.target.value))
+              }}
+              aria-label="Buy-in slider"
               aria-valuetext={formatChips(amount)}
             />
             <div className="flex justify-between text-xs text-subtle tabular">
@@ -50,7 +75,7 @@ export default function BuyInDialog({ open, onClose, title, description, min, ma
               ['Half', Math.min(top, Math.max(min, Math.round(max / 2)))],
               ['Most', top],
             ].map(([label, v]) => (
-              <button key={label} type="button" className={`btn h-11 ${amount === v ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setPicked(v)}>
+              <button key={label} type="button" className={`btn h-11 ${amount === v ? 'btn-primary' : 'btn-ghost'}`} onClick={() => (setTyping(null), setPicked(v))}>
                 {label}
               </button>
             ))}

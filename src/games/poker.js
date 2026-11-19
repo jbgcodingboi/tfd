@@ -209,3 +209,28 @@ export const formatCode = (code) => (code?.length === 6 ? `${code.slice(0, 3)}-$
 
 /** The address of a table, with its join code when it has one. Relative to the site's own address bar (the site uses hash routing). */
 export const tableLink = (origin, tableId, code) => `${origin}/#/games/tables/${tableId}${code ? `?code=${normalizeCode(code)}` : ''}`
+
+/**
+ * What a private table's creator may set for its buy-in range, at given blinds
+ * (supabase/schema.sql poker_create): whole dollars, at least 10 big blinds,
+ * at most 1,000 big blinds and $1,000,000.
+ */
+export const buyInBounds = (bigBlind) => ({ min: 10 * bigBlind, max: Math.min(1000 * bigBlind, 1_000_000) })
+
+/** Why a custom buy-in range can't be used, in the server's words, or null when it can. */
+export function buyInProblem({ min, max }, bigBlind) {
+  const bounds = buyInBounds(bigBlind)
+  if (![min, max].every((v) => Number.isInteger(v) && v > 0)) return 'Buy-ins are whole dollars.'
+  if (min < bounds.min) return `The smallest buy-in at these blinds is ${formatChips(bounds.min)} (10 big blinds).`
+  if (max < min) return 'The largest buy-in can’t be below the smallest.'
+  if (max > bounds.max) return `The largest buy-in at these blinds is ${formatChips(bounds.max)}.`
+  return null
+}
+
+const STEPS = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000]
+
+/** A round slider step for a range: the smallest of 1, 5, 10, 25, 50, 100 ... that leaves at most 200 stops. */
+export function niceStep(lo, hi) {
+  const span = Math.max(0, hi - lo)
+  return STEPS.find((s) => span / s <= 200) ?? STEPS.at(-1)
+}

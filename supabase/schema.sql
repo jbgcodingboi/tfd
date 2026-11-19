@@ -1165,7 +1165,8 @@ begin
   perform private.poker_evict(v_user);
   delete from private.rate_limits where user_id = v_user;
   delete from auth.users where id = v_user;
-  delete from private.leaderboard_cache;
+  -- With a WHERE (the only row is id 1): Supabase refuses a DELETE or UPDATE without one for API callers.
+  delete from private.leaderboard_cache where id = 1;
   return jsonb_build_object('deleted', true);
 end $$;
 
@@ -2623,8 +2624,10 @@ end $$;
 --
 -- Seats and stakes
 --   * Cash tables with 2 to 6 seats at fixed stakes (private.poker_stakes).
---     Chips are whole dollars. A buy-in is 20 to 100 big blinds and moves
---     from cash to the table stack; leaving moves the stack back.
+--     Chips are whole dollars. A public table's buy-in is 50 to 250 big
+--     blinds, and a private table's creator sets their own range (see
+--     poker_create). The buy-in moves from cash to the table stack; leaving
+--     moves the stack back.
 --   * Besides the public tables in the lobby, a signed-up player can open a
 --     private table at any stake. It gets a six-character code; only someone
 --     holding the code (or already seated) can see the table, watch or sit.
@@ -2725,7 +2728,7 @@ $$;
 
 create or replace function private.poker_stakes() returns table (stake text, small_blind bigint, big_blind bigint, min_buy bigint, max_buy bigint)
 language sql immutable set search_path = '' as $$
-  values ('micro', 1::bigint, 2::bigint, 40::bigint, 200::bigint), ('low', 5, 10, 200, 1000), ('mid', 25, 50, 1000, 5000), ('high', 100, 200, 4000, 20000)
+  values ('micro', 1::bigint, 2::bigint, 100::bigint, 500::bigint), ('low', 5, 10, 500, 2500), ('mid', 25, 50, 2500, 12500), ('high', 100, 200, 10000, 50000)
 $$;
 
 -- Hand evaluation ---------------------------------------------------------------
@@ -3435,7 +3438,7 @@ begin
     'seat', (select jsonb_build_object('table', s.table_id, 'stack', s.stack, 'smallBlind', t.small_blind, 'bigBlind', t.big_blind, 'private', t.code is not null)
       from private.poker_seats s join public.poker_tables t on t.id = s.table_id where s.user_id = v_user and not s.leaving),
     -- Private tables this player opened that are still there, so they can find the code again.
-    'mine', coalesce((select jsonb_agg(jsonb_build_object('id', t.id, 'code', t.code, 'smallBlind', t.small_blind, 'bigBlind', t.big_blind, 'seated', t.seated, 'seats', t.max_seats)
+    'mine', coalesce((select jsonb_agg(jsonb_build_object('id', t.id, 'code', t.code, 'smallBlind', t.small_blind, 'bigBlind', t.big_blind, 'minBuy', t.min_buy, 'maxBuy', t.max_buy, 'seated', t.seated, 'seats', t.max_seats)
       order by t.id) from public.poker_tables t where t.owner = v_user and t.code is not null), '[]'),
     'canSit', not private.is_guest(v_user));
 end $$;
@@ -3638,18 +3641,33 @@ end $$;
 
 /**
  * Opens a private table at one of the fixed stakes and returns its id and join
- * code. The code is six characters from an alphabet with no look-alikes
- * (no 0, O, 1 or I), drawn with the cryptographic RNG. Guests can't open one,
- * and a player can have three open at a time.
+ * code. The creator may set the buy-in range (whole dollars, at least 10 big
+ * blinds, at most 1,000 big blinds and $1,000,000); without one the stake's
+ * standard range is used. The code is six characters from an alphabet with no
+ * look-alikes (no 0, O, 1 or I), drawn with the cryptographic RNG. Guests
+ * can't open one, and a player can have three open at a time.
  */
-create or replace function public.poker_create(p_stake text) returns jsonb
+drop function if exists public.poker_create(text);
+create or replace function public.poker_create(p_stake text, p_min_buy numeric default null, p_max_buy numeric default null) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare v_user uuid := private.uid(); st record; v_id bigint; v_code text; alphabet text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; i int; tries int := 0;
+  v_min bigint; v_max bigint; v_floor bigint; v_ceil bigint;
 begin
   perform private.rate_limit(v_user, 'poker-create', 5);
   if private.is_guest(v_user) then return jsonb_build_object('error', 'Sign up to open a private table.'); end if;
   select * into st from private.poker_stakes() s where s.stake = p_stake;
   if st.stake is null then return jsonb_build_object('error', 'Pick one of the listed stakes.'); end if;
+  v_floor := 10 * st.big_blind;
+  v_ceil := least(1000 * st.big_blind, 1000000);
+  if (p_min_buy is not null and (p_min_buy <> trunc(p_min_buy) or not (p_min_buy > 0 and p_min_buy < 1e15)))
+    or (p_max_buy is not null and (p_max_buy <> trunc(p_max_buy) or not (p_max_buy > 0 and p_max_buy < 1e15))) then
+    return jsonb_build_object('error', 'Buy-ins are whole dollars.');
+  end if;
+  v_min := coalesce(p_min_buy::bigint, st.min_buy);
+  v_max := coalesce(p_max_buy::bigint, greatest(st.max_buy, v_min));
+  if v_min < v_floor then return jsonb_build_object('error', format('The smallest buy-in at these blinds is $%s (10 big blinds).', v_floor)); end if;
+  if v_max < v_min then return jsonb_build_object('error', 'The largest buy-in can''t be below the smallest.'); end if;
+  if v_max > v_ceil then return jsonb_build_object('error', format('The largest buy-in at these blinds is $%s.', v_ceil)); end if;
   -- One at a time per player, so two quick clicks can't slip past the limit.
   perform 1 from public.portfolios where user_id = v_user for update;
   if (select count(*) from public.poker_tables where owner = v_user and code is not null) >= 3 then
@@ -3660,7 +3678,7 @@ begin
     for i in 1..6 loop v_code := v_code || substr(alphabet, private.rand_int(length(alphabet)) + 1, 1); end loop;
     begin
       insert into public.poker_tables (stake, small_blind, big_blind, min_buy, max_buy, code, owner)
-      values (st.stake, st.small_blind, st.big_blind, st.min_buy, st.max_buy, v_code, v_user) returning id into v_id;
+      values (st.stake, st.small_blind, st.big_blind, v_min, v_max, v_code, v_user) returning id into v_id;
       exit;
     exception when unique_violation then
       tries := tries + 1;
@@ -3682,6 +3700,12 @@ begin
   if v_id is null then return jsonb_build_object('error', 'No table has that code. Check it and try again.'); end if;
   return jsonb_build_object('table', v_id, 'code', v_code);
 end $$;
+
+-- Public tables follow the standard buy-in ranges above, including ones opened before they were raised. A buy-in is
+-- only checked when a player sits or adds chips, so players already seated are not affected.
+update public.poker_tables t set min_buy = st.min_buy, max_buy = st.max_buy
+from private.poker_stakes() st
+where t.code is null and t.stake = st.stake and (t.min_buy, t.max_buy) is distinct from (st.min_buy, st.max_buy);
 
 -- A table with a free seat at every stake, from the first run on.
 do $$ begin
@@ -3825,7 +3849,7 @@ grant execute on function
   public.poker_state(bigint, text),
   public.poker_tick(bigint),
   public.poker_sit(bigint, numeric, int, text),
-  public.poker_create(text),
+  public.poker_create(text, numeric, numeric),
   public.poker_join(text),
   public.poker_leave(bigint),
   public.poker_act(bigint, text, numeric, int),
