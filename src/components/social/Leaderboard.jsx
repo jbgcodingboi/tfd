@@ -7,7 +7,7 @@ import { useUiStore } from '../../store/uiStore.js'
 import { formatCurrency, formatPercent, formatSignedCurrency, pnlTone } from '../../utils/format.js'
 import Tabs from '../ui/Tabs.jsx'
 import SimTag from './SimTag.jsx'
-import { GAME_NAME } from '../../games/names.js'
+import { GAME_NAME, GAME_PATH } from '../../games/names.js'
 
 const medal = ['text-warn', 'text-fg/80', 'text-[#c98b5a]']
 const DASH = <span className="text-subtle">—</span>
@@ -71,6 +71,29 @@ const BOARDS = {
   },
 }
 
+/**
+ * Texas Hold'em winnings: what each player has won at the tables this run, the
+ * chips won in a hand less the chips they put in. Only players with a hand
+ * played are listed, and only with the backend (it needs other players).
+ */
+if (BACKEND_ENABLED) {
+  BOARDS.poker = {
+    label: 'Poker',
+    caption: `Ranked by chips won at ${GAME_NAME.poker} this run: what you won in a hand less what you put in. Only players who have played a hand are listed.`,
+    score: (r) => r.poker?.net ?? 0,
+    include: (r) => (r.poker?.hands ?? 0) > 0,
+    yours: (r) => formatSignedCurrency(r.poker?.net ?? 0),
+    yoursLabel: 'Poker net',
+    columns: [
+      { label: 'Poker net', cell: (r) => signed(r.poker?.net) },
+      { label: 'Hands', cell: (r) => count(r.poker?.hands ?? 0), muted: true },
+      { label: 'Per hand', cell: (r) => signed(r.poker?.hands ? Math.round((r.poker.net / r.poker.hands) * 100) / 100 : null) },
+      { label: 'Biggest win', cell: (r) => (r.poker?.best > 0 ? <span className="text-yes">{formatSignedCurrency(r.poker.best)}</span> : DASH) },
+      { label: 'Chips played', cell: (r) => formatCurrency(r.poker?.wagered ?? 0) },
+    ],
+  }
+}
+
 const TABS = Object.entries(BOARDS).map(([id, b]) => ({ id, label: b.label }))
 
 /** Leaderboards for net worth, market trading and games across local accounts and simulated pros. */
@@ -116,11 +139,11 @@ export default function Leaderboard() {
             Sign up
           </button>
         </div>
-      ) : user && boardId === 'games' ? (
+      ) : user && (boardId === 'games' || boardId === 'poker') ? (
         <div className="card flex flex-wrap items-center justify-between gap-3 p-4 text-sm text-muted">
-          Play a round of any game to join the Games board.
-          <Link to="/games" className="btn btn-primary">
-            Go to Games
+          {boardId === 'poker' ? `Play a hand of ${GAME_NAME.poker} to join the Poker board.` : 'Play a round of any game to join the Games board.'}
+          <Link to={boardId === 'poker' ? GAME_PATH.poker : '/games'} className="btn btn-primary">
+            {boardId === 'poker' ? 'Go to the tables' : 'Go to Games'}
           </Link>
         </div>
       ) : !user ? (
@@ -187,7 +210,7 @@ export default function Leaderboard() {
             {!rows.length && (
               <tr>
                 <td colSpan={board.columns.length + 2} className="px-4 py-10 text-center text-muted">
-                  Nobody has played yet.
+                  {boardId === 'poker' ? 'Nobody has played a hand yet.' : 'Nobody has played yet.'}
                 </td>
               </tr>
             )}

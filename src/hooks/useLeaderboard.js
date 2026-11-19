@@ -147,6 +147,8 @@ function useServerLeaderboard() {
               unrealized: num(r.unrealized),
               winRate: num(r.winRate),
               games: { ...r.games, net: num(r.games?.net), wagered: num(r.games?.wagered), best: num(r.games?.best) },
+              // Texas Hold'em this run, for players who have played a hand.
+              poker: r.poker ? { hands: num(r.poker.hands), net: num(r.poker.net), wagered: num(r.poker.wagered), best: num(r.poker.best) } : null,
             })),
           )
         })

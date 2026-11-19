@@ -234,3 +234,27 @@ export function niceStep(lo, hi) {
   const span = Math.max(0, hi - lo)
   return STEPS.find((s) => span / s <= 200) ?? STEPS.at(-1)
 }
+
+/**
+ * The starting buy-in range of a private table: the stake's smallest public
+ * buy-in, and twice that. (supabase/schema.sql poker_create uses the same
+ * range when none is sent.)
+ */
+export const privateStandard = (stake) => ({ min: stake.minBuy, max: 2 * stake.minBuy })
+
+/**
+ * When the two ends of a buy-in range move together (largest = 2 x smallest),
+ * what to set after one end changes: `side` is 'min' or 'max', `value` the
+ * text typed or the slider position. Returns the text for the ends that
+ * change. The other end stays inside `bounds` (buyInBounds); a value that
+ * isn't a whole number above zero changes nothing but the end being typed in.
+ */
+export function linkRange(side, value, bounds) {
+  const n = Number(value)
+  if (!Number.isInteger(n) || n <= 0) return { [side]: value }
+  if (side === 'min') return { min: value, max: String(Math.min(2 * n, bounds.max)) }
+  return { max: value, min: String(Math.max(bounds.min, Math.floor(n / 2))) }
+}
+
+/** Blinds as shown: "$5/$10", "$500/$1,000". */
+export const formatBlinds = (small, big, sep = '/') => `${formatChips(small)}${sep}${formatChips(big)}`

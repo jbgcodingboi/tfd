@@ -82,22 +82,22 @@ async function main() {
   const a = await player(browser, 'north_seat')
   const b = await player(browser, 'south_seat')
 
-  // The lobby, then both players sit at the $1/$2 table.
+  // The lobby, then both players sit at the $5/$10 table.
   await a.page.goto(`${SITE}/#/games/tables`)
-  await a.page.getByRole('heading', { name: '$1 / $2' }).waitFor()
+  await a.page.getByRole('heading', { name: '$5 / $10' }).waitFor()
   check((await a.page.title()) === 'Games · Chami Market', 'the tab title stays neutral')
   check((await a.page.getByRole('list', { name: 'Open tables' }).getByRole('listitem').count()) === 4, 'the lobby lists a table at each of the four stakes')
   await shot(a.page, '1-lobby.png')
-  await a.page.getByRole('link', { name: /\$1 \/ \$2/ }).click()
+  await a.page.getByRole('link', { name: /\$5 \/ \$10/ }).click()
   const tableUrl = await a.page.waitForURL(/games\/tables\/\d+/).then(() => a.page.url())
   for (const p of [a, b]) {
     if (p === b) await b.page.goto(tableUrl)
     await p.page.getByRole('button', { name: 'Take a seat' }).click()
     await p.page.getByRole('button', { name: 'Most' }).click()
-    await p.page.getByRole('button', { name: /Sit down with \$500/ }).click()
+    await p.page.getByRole('button', { name: /Sit down with \$2,500/ }).click()
     await p.page.getByLabel(/\(you\), \$/).waitFor()
   }
-  check(true, 'both players bought in for the $500 maximum and are seated')
+  check(true, 'both players bought in for the $2,500 maximum and are seated')
 
   // The first hand is dealt by the clock. Each player sees two cards of their own and none of the other's.
   await a.page.getByText(/Hand #1/).waitFor({ timeout: 20000 })
@@ -147,7 +147,7 @@ async function main() {
   await shot(a.page, '4-showdown.png')
   const state = await post('/rest/v1/rpc/poker_state', { p_table: Number(tableUrl.split('/').pop()) }, a.session.access_token)
   const stacks = state.table.state.seats.filter(Boolean).map((s) => s.stack)
-  check(stacks.reduce((x, y) => x + y, 0) === 1000, `the two stacks still add up to the $1,000 brought to the table (${stacks.join(' + ')})`)
+  check(stacks.reduce((x, y) => x + y, 0) === 5000, `the two stacks still add up to the $5,000 brought to the table (${stacks.join(' + ')})`)
 
   // The fairness check opens the seals of the cards that were shown.
   await a.page.getByText('Fair deal', { exact: true }).click()
@@ -171,14 +171,26 @@ async function main() {
   await shot(b.page, '5-watching.png')
   // A private table: one player opens it and reads out its code, a friend types the code in and sits down.
   await a.page.goto(`${SITE}/#/games/tables`)
-  await a.page.getByRole('radio', { name: '$1/$2' }).click()
-  check((await a.page.getByLabel('Smallest buy-in', { exact: true }).inputValue()) === '100' && (await a.page.getByLabel('Largest buy-in', { exact: true }).inputValue()) === '500', 'the form starts at the standard $100 to $500 buy-in')
-  await a.page.getByLabel('Smallest buy-in', { exact: true }).fill('19')
-  await a.page.getByText(/smallest buy-in at these blinds is \$20/).waitFor()
+  const smallest = a.page.getByLabel('Smallest buy-in', { exact: true })
+  const largest = a.page.getByLabel('Largest buy-in', { exact: true })
+  await a.page.getByRole('radio', { name: '$5/$10' }).click()
+  check((await smallest.inputValue()) === '500' && (await largest.inputValue()) === '1000', 'the form starts at the standard $500 to $1,000: the largest is twice the smallest')
+  await smallest.fill('99')
+  await a.page.getByText(/smallest buy-in at these blinds is \$100/).waitFor()
   check(await a.page.getByRole('button', { name: 'Create table' }).isDisabled(), 'a buy-in below 10 big blinds is refused on the form')
-  await a.page.getByLabel('Smallest buy-in', { exact: true }).fill('150')
-  await a.page.getByLabel('Largest buy-in slider').fill('300')
-  check((await a.page.getByLabel('Largest buy-in', { exact: true }).inputValue()) === '300', 'the slider moves the typed amount')
+  await smallest.fill('150')
+  check((await largest.inputValue()) === '300', 'Auto 1:2: typing the smallest moves the largest to twice it')
+  await largest.fill('400')
+  check((await smallest.inputValue()) === '200', 'and typing the largest moves the smallest to half of it')
+  await a.page.getByLabel('Largest buy-in slider').fill('1500')
+  check((await smallest.inputValue()) === '750', 'and so does the slider')
+  await a.page.getByRole('button', { name: 'Custom…' }).click()
+  await smallest.fill('150')
+  check((await largest.inputValue()) === '1500', 'Custom…: the largest no longer follows the smallest')
+  await a.page.getByRole('button', { name: 'Reset to standard' }).click()
+  check((await smallest.inputValue()) === '500' && (await largest.inputValue()) === '1000' && (await a.page.getByRole('button', { name: 'Auto 1:2' }).getAttribute('aria-pressed')) === 'true',
+    'Reset to standard brings back $500 to $1,000 and Auto 1:2')
+  await smallest.fill('150')
   await a.page.getByRole('button', { name: 'Create table' }).click()
   await a.page.waitForURL(/games\/tables\/\d+\?code=[A-Z2-9]{6}/)
   const privateUrl = a.page.url()
@@ -202,10 +214,19 @@ async function main() {
   await b.page.getByRole('button', { name: 'Least' }).click()
   await b.page.getByRole('button', { name: 'Sit down with $150' }).click()
   await b.page.getByLabel(/\(you\), \$/).waitFor()
-  check(true, 'a friend typed the code and sat down at the $150 minimum of the custom range')
+  check(true, 'a friend typed the code and sat down at the $150 minimum of the custom range ($150 to $300)')
   const spectator = await post('/rest/v1/rpc/poker_state', { p_table: Number(privateId) }, a.session.access_token)
   const outsider = await post('/rest/v1/rpc/poker_state', { p_table: Number(privateId) }, (await post('/auth/v1/signup', { email: 'outsider_x@users.chamimarket.app', password: 'correct horse battery', data: { username: 'outsider_x' } })).access_token)
   check(spectator.table && outsider.private === true && !outsider.table, `a player without the code gets nothing back about the table (${JSON.stringify(outsider).slice(0, 120)})`)
+  // The Poker leaderboard lists the players who have played a hand, with their winnings.
+  let board = ''
+  for (let i = 0; i < 4 && !(board.includes('north_seat') && board.includes('south_seat')); i++) {
+    await a.page.goto(`${SITE}/#/leaderboard?board=poker`)
+    await a.page.getByRole('tabpanel').waitFor()
+    await a.page.waitForTimeout(i ? 4000 : 800)
+    board = await a.page.getByRole('tabpanel').innerText()
+  }
+  check(board.includes('north_seat') && board.includes('south_seat') && /Poker net/.test(board), 'the Poker leaderboard lists both players, ranked by what they won')
   check(a.errors.length === 0 && b.errors.length === 0, `no errors in either browser${a.errors.concat(b.errors).length ? `: ${a.errors.concat(b.errors).join(' | ')}` : ''}`)
   await browser.close()
 }
